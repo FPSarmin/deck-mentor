@@ -3,7 +3,6 @@ name: Build
 on:
   push:
     branches: [main]
-    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -34,7 +33,19 @@ jobs:
         with:
           name: deck-mentor
           path: out/deck-mentor.zip
-      - if: startsWith(github.ref, 'refs/tags/v')
+      - id: version
+        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+      # Every push to main publishes out/deck-mentor.zip as release v<package.json version>,
+      # so the stable install URL is .../releases/latest/download/deck-mentor.zip
+      - if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ steps.version.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          name: Deck Mentor v${{ steps.version.outputs.version }}
+          make_latest: true
           files: out/deck-mentor.zip
+          body: |
+            Установка: Decky → Настройки → «Установить плагин по URL» и вставить
+            https://github.com/FPSarmin/deck-mentor/releases/latest/download/deck-mentor.zip
+            Перед этим один раз установите Claude Code и войдите через /login (см. README).
