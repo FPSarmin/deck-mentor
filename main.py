@@ -6,6 +6,7 @@ pushed back with `decky.emit(EVENT, payload)`.
 
 import asyncio
 import base64
+import json
 import os
 import sys
 import time
@@ -17,15 +18,19 @@ _PY_MODULES = os.path.join(decky.DECKY_PLUGIN_DIR, "py_modules")
 if _PY_MODULES not in sys.path:
     sys.path.insert(0, _PY_MODULES)
 
-from deck_mentor import capture, claude_cli, cleanup, games, prompts  # noqa: E402
-from deck_mentor.hotkey import COMBOS, HotkeyListener  # noqa: E402
+from deck_mentor import capture, claude_cli, cleanup, downloads, games, prompts  # noqa: E402
+from deck_mentor.hotkey import COMBOS, Binding, HotkeyListener  # noqa: E402
 from deck_mentor.store import GameState, Settings  # noqa: E402
+from deck_mentor.util import clean_env, dir_size, which  # noqa: E402
+from deck_mentor.voice import PIPER_VOICES, WHISPER_MODELS, Voice, VoiceError  # noqa: E402
 
 EVENT = "deck_mentor_event"
 HOTKEY_EVENT = "deck_mentor_hotkey"
 QUICK_TIMEOUT = 240
 DEEP_TIMEOUT = 1500
 CLEANUP_EVERY = 6 * 3600
+REPO = "FPSarmin/deck-mentor"
+UPDATE_EVERY = 12 * 3600
 
 NOT_LOGGED_IN = (
     "Claude Code не вошёл в аккаунт. В режиме рабочего стола откройте Konsole, "
@@ -52,7 +57,16 @@ class Plugin:
         self.current = None
         self.cli_info = None
         self.last_cleanup = 0.0
-        self.hotkey = HotkeyListener(self._hotkey_from_thread, decky.logger)
+        self.hotkey = HotkeyListener(decky.logger)
+        self.voice = Voice(decky.DECKY_PLUGIN_DIR, decky.DECKY_PLUGIN_RUNTIME_DIR, decky.logger)
+        self.limits_path = os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, "limits.json")
+        try:
+            with open(self.limits_path, encoding="utf-8") as fh:
+                self.limits = json.load(fh)
+        except (OSError, ValueError):
+            self.limits = None
+        self.update_info = None
+        self.speak_task = None
         self._ready = True
 
     async def _main(self):
@@ -68,6 +82,8 @@ class Plugin:
     async def _unload(self):
         if getattr(self, "_ready", False):
             self.hotkey.stop()
+            await self.voice.cancel_recording()
+            await self.voice.stop_speaking()
             await self.cancel()
 
     async def _uninstall(self):
@@ -91,15 +107,74 @@ class Plugin:
     async def _emit(self, payload: dict):
         await decky.emit(EVENT, payload)
 
-    def _hotkey_from_thread(self):
-        self.loop.call_soon_threadsafe(lambda: asyncio.ensure_future(decky.emit(HOTKEY_EVENT)))
+    def _from_thread(self, factory):
+        """Run `factory()` (a coroutine function) on the event loop from the hotkey thread."""
+        self.loop.call_soon_threadsafe(lambda: asyncio.ensure_future(factory()))
+
+    async def _hotkey_event(self, payload: dict):
+        await decky.emit(HOTKEY_EVENT, payload)
 
     def _apply_hotkey(self):
-        self.hotkey.configure(self.settings["hotkey_combo"])
+        bindings = []
         if self.settings["hotkey_enabled"]:
-            self.hotkey.start()
-        else:
-            self.hotkey.stop()
+            bindings.append(Binding(self.settings["hotkey_combo"], 0.35,
+                                    lambda: self._from_thread(lambda: self._hotkey_event({"kind": "hint"}))))
+        if self.settings["voice_enabled"] and self.settings["voice_combo"] != self.settings["hotkey_combo"]:
+            bindings.append(Binding(self.settings["voice_combo"], 0.25,
+                                    lambda: self._from_thread(self._voice_hold),
+                                    lambda: self._from_thread(self._voice_release)))
+        self.hotkey.set_bindings(bindings)
+
+    # Push-to-talk: hold the voice combo, speak, let go.
+    async def _voice_hold(self):
+        if self.task and not self.task.done():
+            await self._hotkey_event({"kind": "voice_error", "text": "Ещё думаю над прошлым вопросом…"})
+            return
+        try:
+            if not os.path.isfile(self.voice.model_path(self.settings["voice_model"])):
+                raise VoiceError("Модель распознавания не скачана: откройте настройки голоса.")
+            await self.voice.stop_speaking()
+            await self.voice.start_recording()
+            await self._hotkey_event({"kind": "voice_listening"})
+        except (VoiceError, OSError) as exc:
+            await self._hotkey_event({"kind": "voice_error", "text": str(exc)})
+
+    async def _voice_release(self):
+        try:
+            wav = await self.voice.stop_recording()
+            await self._hotkey_event({"kind": "voice_transcribing"})
+            text = await self.voice.transcribe(wav, self.settings["voice_model"], self.settings["voice_language"])
+            await self._hotkey_event({"kind": "voice", "text": text})
+        except (VoiceError, OSError, asyncio.TimeoutError) as exc:
+            await self._hotkey_event({"kind": "voice_error", "text": str(exc) or "Ошибка распознавания"})
+
+    def _speak_later(self, text: str):
+        if self.speak_task and not self.speak_task.done():
+            self.speak_task.cancel()
+
+        async def run():
+            try:
+                await self.voice.speak(text, self.settings["tts_voice"])
+            except (VoiceError, OSError, asyncio.TimeoutError) as exc:
+                decky.logger.warning("tts failed: %s", exc)
+
+        self.speak_task = self.loop.create_task(run())
+
+    def _save_limits(self, info: dict):
+        windows = info.get("unifiedWindows") or {}
+        self.limits = {
+            "status": info.get("status"),
+            "type": info.get("rateLimitType"),
+            "resets_at": info.get("resetsAt"),
+            "windows": {k: {"utilization": v.get("utilization"), "resets_at": v.get("resetsAt"),
+                            "status": v.get("status")} for k, v in windows.items() if isinstance(v, dict)},
+            "updated": int(time.time()),
+        }
+        try:
+            with open(self.limits_path, "w", encoding="utf-8") as fh:
+                json.dump(self.limits, fh)
+        except OSError:
+            pass
 
     async def _cleanup(self, everything: bool = False) -> int:
         if self.task and not self.task.done():
@@ -134,6 +209,12 @@ class Plugin:
             "current": self.current,
             "hotkey_status": self.hotkey.status,
             "storage_bytes": usage,
+            "voice_bytes": await asyncio.to_thread(dir_size, self.voice.dir),
+            "voice": self.voice.status(self.settings["voice_model"], self.settings["tts_voice"]),
+            "voice_options": {"models": {k: v[1] for k, v in WHISPER_MODELS.items()}, "voices": list(PIPER_VOICES)},
+            "limits": self.limits if self.settings["auth_mode"] == "subscription" else None,
+            "version": getattr(decky, "DECKY_PLUGIN_VERSION", ""),
+            "update": self.update_info,
             "game": {
                 "notes": state.data.get("notes", ""),
                 "history": state.data.get("history", [])[-30:],
@@ -157,11 +238,15 @@ class Plugin:
         patch = dict(patch or {})
         if patch.get("api_key", "").startswith("••••"):
             patch.pop("api_key")
-        if "hotkey_combo" in patch and patch["hotkey_combo"] not in COMBOS:
-            patch.pop("hotkey_combo")
+        for key in ("hotkey_combo", "voice_combo"):
+            if key in patch and patch[key] not in COMBOS:
+                patch.pop(key)
+        if patch.get("voice_model") not in (None, *WHISPER_MODELS):
+            patch.pop("voice_model")
+        if patch.get("tts_voice") not in (None, *PIPER_VOICES):
+            patch.pop("tts_voice")
         data = self.settings.update(patch)
-        if {"hotkey_enabled", "hotkey_combo"} & patch.keys():
-            self.hotkey.stop()
+        if {"hotkey_enabled", "hotkey_combo", "voice_enabled", "voice_combo"} & patch.keys():
             self._apply_hotkey()
         if {"auth_mode", "api_key", "claude_path"} & patch.keys():
             self.cli_info = None
@@ -216,8 +301,8 @@ class Plugin:
             self.task.cancel()
         return True
 
-    async def ask(self, appid, game_name, question, with_shot=False, mode="quick", origin="panel"):
-        """Start a request. mode: quick | deep. origin: panel | hotkey."""
+    async def ask(self, appid, game_name, question, with_shot=False, mode="quick", origin="panel", facts=None):
+        """Start a request. mode: quick | deep. origin: panel | hotkey | voice."""
         self._ensure()
         if self.task and not self.task.done():
             return {"ok": False, "error": "Я ещё отвечаю на прошлый вопрос."}
@@ -229,8 +314,102 @@ class Plugin:
             "started": time.time(),
         }
         self.task = self.loop.create_task(self._run(request_id, int(appid or 0), game_name or "",
-                                                    question or "", bool(with_shot), mode, origin))
+                                                    question or "", bool(with_shot), mode, origin,
+                                                    facts if isinstance(facts, dict) else None))
         return {"ok": True, "request_id": request_id}
+
+    # ------------------------------------------------------- voice and TTS
+    async def voice_setup(self, kind):
+        """Download what the voice feature needs. kind: stt | tts. Progress goes out as events."""
+        self._ensure()
+        if self.voice.busy_downloading:
+            return {"ok": False, "error": "Уже скачиваю."}
+        self.voice.busy_downloading = True
+
+        async def progress(fraction):
+            await self._emit({"id": "setup", "type": "download", "kind": kind, "progress": round(fraction, 3)})
+
+        try:
+            if kind == "stt":
+                await self.voice.ensure_stt(self.settings["voice_model"], progress)
+            else:
+                await self.voice.ensure_tts(self.settings["tts_voice"], progress)
+            return {"ok": True}
+        except (VoiceError, downloads.DownloadError, OSError) as exc:
+            return {"ok": False, "error": str(exc)}
+        finally:
+            self.voice.busy_downloading = False
+
+    async def voice_remove(self):
+        self._ensure()
+        freed = await asyncio.to_thread(self.voice.remove_downloads)
+        self.settings.update({"voice_enabled": False, "tts_enabled": False})
+        self._apply_hotkey()
+        return {"freed_bytes": freed}
+
+    async def voice_record_start(self):
+        self._ensure()
+        try:
+            await self.voice.stop_speaking()
+            await self.voice.start_recording()
+            return {"ok": True}
+        except (VoiceError, OSError) as exc:
+            return {"ok": False, "error": str(exc)}
+
+    async def voice_record_stop(self):
+        self._ensure()
+        try:
+            wav = await self.voice.stop_recording()
+            text = await self.voice.transcribe(wav, self.settings["voice_model"], self.settings["voice_language"])
+            return {"ok": True, "text": text}
+        except (VoiceError, OSError, asyncio.TimeoutError) as exc:
+            return {"ok": False, "error": str(exc) or "Ошибка распознавания"}
+
+    async def speak(self, text):
+        self._ensure()
+        try:
+            await self.voice.speak(str(text), self.settings["tts_voice"])
+            return {"ok": True}
+        except (VoiceError, OSError, asyncio.TimeoutError) as exc:
+            return {"ok": False, "error": str(exc)}
+
+    async def stop_speaking(self):
+        self._ensure()
+        await self.voice.stop_speaking()
+        return True
+
+    # -------------------------------------------------------------- updates
+    async def check_update(self, force=False):
+        self._ensure()
+        if not force and self.update_info and time.time() - self.update_info.get("checked", 0) < UPDATE_EVERY:
+            return self.update_info
+        env = clean_env()
+        curl = which("curl", env)
+        if not curl:
+            return None
+        rc, out, _err = await claude_cli.run_simple(
+            [curl, "-fsSL", "-H", "Accept: application/vnd.github+json",
+             f"https://api.github.com/repos/{REPO}/releases/latest"], env, timeout=20)
+        if rc != 0:
+            return self.update_info
+        try:
+            data = json.loads(out)
+        except ValueError:
+            return self.update_info
+        latest = str(data.get("tag_name", "")).lstrip("v")
+        url = next((a.get("browser_download_url") for a in data.get("assets", [])
+                    if a.get("name") == "deck-mentor.zip"), "")
+        current = getattr(decky, "DECKY_PLUGIN_VERSION", "") or "0"
+
+        def parse(v):
+            return tuple(int(p) if p.isdigit() else 0 for p in v.split("."))
+
+        self.update_info = {
+            "current": current, "latest": latest, "url": url,
+            "newer": bool(latest and url and parse(latest) > parse(current)),
+            "notes": str(data.get("body") or "")[:600], "checked": time.time(),
+        }
+        return self.update_info
 
     # -------------------------------------------------------------- the work
     async def _status(self, rid, text):
@@ -243,7 +422,7 @@ class Plugin:
         await self._emit({"id": rid, "type": "done", "ok": ok, "answer": answer, "error": error,
                           "origin": cur["origin"], "mode": cur["mode"], "game": cur["game"]})
 
-    async def _run(self, rid, appid, game_name, question, with_shot, mode, origin):
+    async def _run(self, rid, appid, game_name, question, with_shot, mode, origin, facts=None):
         state = self._game(appid)
         deep = mode == "deep"
         try:
@@ -265,7 +444,8 @@ class Plugin:
             os.makedirs(state.dir, exist_ok=True)
             spoiler = self.settings["spoiler"]
             context = prompts.context_block(game_name, appid or None, spoiler, state.data.get("notes", ""),
-                                            "" if deep else state.guide(), quick=(origin == "hotkey"))
+                                            "" if deep else state.guide(), quick=(origin in ("hotkey", "voice")),
+                                            facts=facts)
 
             web = ["WebSearch", "WebFetch"] if self.settings["web_search"] else []
             tools, allowed = list(web), list(web)
@@ -274,9 +454,10 @@ class Plugin:
                 await self._status(rid, "Копирую сохранения…")
                 saves_dir = os.path.join(state.dir, "saves")
                 cleanup.remove_path(saves_dir)
-                copied = await asyncio.to_thread(games.copy_saves, appid, saves_dir)
+                copied = await asyncio.to_thread(games.copy_saves, appid, saves_dir, 300_000_000, 64_000_000,
+                                                 game_name)
                 os.makedirs(os.path.join(state.dir, "scratch"), exist_ok=True)
-                install = await asyncio.to_thread(games.install_dir, appid) if appid else None
+                install = await asyncio.to_thread(games.guess_install_dir, appid, game_name)
                 if install:
                     extra_args += ["--add-dir", install]
                 tools = ["Read", "Glob", "Grep", "Bash", "Write", "Edit"] + web
@@ -344,6 +525,9 @@ class Plugin:
             state.record(label, answer or error, bool(png_b64), mode, ok)
             state.save()
             await self._finish(rid, ok or bool(answer), answer=answer, error=error)
+            if (answer and origin in ("hotkey", "voice") and self.settings["tts_enabled"]
+                    and self.settings["tts_auto"]):
+                self._speak_later(answer.split(prompts.SPOILER_MARK)[0])
         except asyncio.CancelledError:
             await self._finish(rid, False, error="Отменено.")
         except asyncio.TimeoutError:
@@ -379,6 +563,9 @@ class Plugin:
             elif kind == "tool":
                 self.current["tools"].append(event["label"])
                 await self._status(rid, event["label"])
+            elif kind == "limits":
+                self._save_limits(event["info"])
+                await self._emit({"id": rid, "type": "limits", "limits": self.limits})
             elif kind == "limit":
                 limit_hit = event
             elif kind == "result":

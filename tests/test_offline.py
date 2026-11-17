@@ -1,6 +1,9 @@
-"""Offline checks: PNG encoding, capture pipeline (videotestsrc), hotkey parsing, cleanup, save copying."""
+"""Offline checks: PNG, capture pipeline (videotestsrc), hotkeys, cleanup, save copying, prompts, voice text."""
 import asyncio
+import logging
 import os
+import socket
+import threading
 import struct
 import sys
 import tempfile
@@ -10,7 +13,8 @@ import zlib
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "py_modules"))
 
-from deck_mentor import capture, cleanup, games, hotkey  # noqa: E402
+from deck_mentor import capture, cleanup, games, hotkey, prompts  # noqa: E402
+from deck_mentor.voice import Voice  # noqa: E402
 
 
 def decode_png(png):
@@ -119,6 +123,123 @@ def test_copy_saves():
         assert info["copied_bytes"] == 104
         assert "ArchiveSaveFile" not in open(os.path.join(dest, "SOURCES.txt")).read() or True
         del os.environ["DECKY_USER_HOME"]
+
+
+def _report(*buttons):
+    low = sum(hotkey._LOW[b] for b in buttons if b in hotkey._LOW)
+    high = sum(hotkey._HIGH[b] for b in buttons if b in hotkey._HIGH)
+    r = bytearray(64)
+    r[0], r[2] = 1, hotkey.REPORT_DECK_STATE
+    struct.pack_into("<II", r, 8, low, high)
+    return bytes(r)
+
+
+def test_hotkey_bindings():
+    calls = []
+    lst = hotkey.HotkeyListener(logging.getLogger("t"))
+    lst._bindings = [
+        hotkey.Binding("L4+R4", 0.35, lambda: calls.append("hint")),
+        hotkey.Binding("L5+R5", 0.25, lambda: calls.append("listen"), lambda: calls.append("release")),
+    ]
+    lst.feed({"L4"}, 0.0)
+    lst.feed({"L4", "R4"}, 0.1)
+    lst.feed({"L4", "R4"}, 0.3)
+    assert calls == []
+    lst.feed({"L4", "R4", "A"}, 0.5)
+    lst.feed({"L4", "R4"}, 0.9)
+    assert calls == ["hint"], calls  # fires once per hold
+    lst.feed(set(), 1.0)
+    lst.feed({"L5", "R5"}, 1.1)
+    lst.feed({"L5", "R5"}, 1.2)  # released too early: nothing
+    lst.feed({"L5"}, 1.3)
+    assert calls == ["hint"], calls
+    lst.feed({"L5", "R5"}, 2.0)
+    lst.feed({"L5", "R5"}, 2.3)
+    lst.feed({"R5"}, 4.0)
+    assert calls == ["hint", "listen", "release"], calls
+
+
+def test_hotkey_loop_reads_only_changes():
+    """Run the real read loop on a socket that keeps message boundaries like hidraw does."""
+    calls = []
+    lst = hotkey.HotkeyListener(logging.getLogger("t"))
+    lst._bindings = [hotkey.Binding("L4+R4", 0.3, lambda: calls.append("hint"))]
+    reader, writer = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    reader.setblocking(False)
+    t = threading.Thread(target=lst._loop, args=(reader.fileno(),), daemon=True)
+    t.start()
+    held = _report("L4", "R4")
+    end = time.time() + 0.6
+    while time.time() < end:  # the controller streams reports even when nothing changes
+        writer.send(held)
+        time.sleep(0.004)
+    writer.send(_report())
+    time.sleep(0.1)
+    lst._stop.set()
+    t.join(1)
+    reader.close()
+    writer.close()
+    assert calls == ["hint"], calls
+
+
+def test_other_save_sources():
+    with tempfile.TemporaryDirectory() as home:
+        os.environ["DECKY_USER_HOME"] = home
+
+        def touch(rel, data=b"save"):
+            path = os.path.join(home, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            open(path, "wb").write(data)
+
+        touch("Games/Heroic/Prefixes/default/Hollow Knight/pfx/drive_c/users/deck/AppData/LocalLow/Team Cherry/Hollow Knight/user1.dat")
+        touch(".config/unity3d/Team Cherry/Hollow Knight/user2.dat")
+        touch(".local/share/applications/hollow.desktop")
+        touch(".local/share/data/x.bin")
+        touch("Emulation/saves/retroarch/saves/Pokemon Emerald (USA).srm")
+        touch("Emulation/saves/retroarch/saves/Other Game.srm")
+
+        found = games.other_save_sources(0, "Heroic - Hollow Knight")
+        labels = sorted((label, os.path.relpath(path, home)) for label, path, _ in found)
+        assert ("heroic", "Games/Heroic/Prefixes/default/Hollow Knight/pfx/drive_c/users/deck") in labels, labels
+        assert ("native", ".config/unity3d/Team Cherry/Hollow Knight") in labels, labels
+        assert not any("applications" in p or p.endswith("/data") for _, p in labels), labels
+        assert games.guess_install_dir(0, "Hollow Knight") is None  # Heroic/Prefixes is not an install dir
+
+        dest = os.path.join(home, "out")
+        games.copy_saves(0, dest, game_name="Hollow Knight")
+        copied = [os.path.relpath(os.path.join(r, f), dest) for r, _, fs in os.walk(dest) for f in fs]
+        assert any(c.endswith("Hollow Knight/user1.dat") for c in copied), copied
+        assert "native_1/user2.dat" in copied, copied
+        assert not any("hollow.desktop" in c for c in copied), copied
+
+        dest2 = os.path.join(home, "out2")
+        games.copy_saves(0, dest2, game_name="Pokemon Emerald")
+        copied = [f for _, _, fs in os.walk(dest2) for f in fs]
+        assert "Pokemon Emerald (USA).srm" in copied and "Other Game.srm" not in copied, copied
+        assert not games._matches("data", ["datawing"])
+        del os.environ["DECKY_USER_HOME"]
+
+
+def test_prompt_facts():
+    assert prompts.facts_block(None) == ""
+    assert prompts.facts_block({"source": "steam"}) == ""
+    block = prompts.facts_block({
+        "source": "steam", "playtime_minutes": 754, "achievements_total": 40, "achievements_unlocked": 12,
+        "recent_achievements": [{"name": "Beat the Bull", "description": "Defeat Guangzhi"}],
+    })
+    assert "playtime: 12.6 h" in block and "12 of 40" in block and "- Beat the Bull: Defeat Guangzhi" in block
+    ns = prompts.facts_block({"source": "non-steam", "playtime_minutes": 0})
+    assert "non-Steam" in ns and "achievements" not in ns
+    ctx = prompts.context_block("Game", 0, "hint", "", "", True, {"source": "non-steam"})
+    assert "spoiler_level: hint" in ctx and "Steam appid" not in ctx and "<game_facts>" in ctx
+    assert prompts.SPOILER_MARK in prompts.SYSTEM_PROMPT
+
+
+def test_speakable():
+    text = "Иди к **мосту**.\n- Возьми ключ\n- Открой дверь https://wiki.example/x\n"
+    assert Voice.speakable(text) == "Иди к мосту.. Возьми ключ. Открой дверь".replace("..", ".")
+    long = "Слово. " * 300
+    assert len(Voice.speakable(long)) <= 700
 
 
 if __name__ == "__main__":

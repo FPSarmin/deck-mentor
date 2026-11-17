@@ -2,20 +2,33 @@ import { Navigation, Router } from "@decky/ui";
 import { toaster } from "@decky/api";
 import { useEffect, useState } from "react";
 import * as api from "./backend";
-import type { BackendEvent, Request, Settings } from "./backend";
+import type { BackendEvent, Facts, HotkeyEvent, Limits, Request, Settings } from "./backend";
 
 /** Shared state that outlives the Quick Access panel (it unmounts when closed). */
 let current: Request | null = null;
 let settings: Settings | null = null;
+let limits: Limits | null = null;
+let download: { kind: string; progress: number } | null = null;
 let panelOpen = false;
 let reopenAfterCapture = false;
 const listeners = new Set<() => void>();
 
+let notifyTimer: ReturnType<typeof setTimeout> | null = null;
+
 function notify() {
+  if (notifyTimer) {
+    clearTimeout(notifyTimer);
+    notifyTimer = null;
+  }
   listeners.forEach((fn) => fn());
 }
 
-export function useCurrent(): Request | null {
+/** Streaming text arrives in dozens of small pieces a second; redraw the panel at most ~4 times a second. */
+function notifySoon(ms = 250) {
+  if (!notifyTimer) notifyTimer = setTimeout(notify, ms);
+}
+
+function useStore<T>(get: () => T): T {
   const [, force] = useState(0);
   useEffect(() => {
     const fn = () => force((n) => n + 1);
@@ -24,11 +37,20 @@ export function useCurrent(): Request | null {
       listeners.delete(fn);
     };
   }, []);
-  return current;
+  return get();
 }
+
+export const useCurrent = () => useStore(() => current);
+export const useLimits = () => useStore(() => limits);
+export const useDownload = () => useStore(() => download);
 
 export function setCurrent(req: Request | null) {
   current = req;
+  notify();
+}
+
+export function setLimits(l: Limits | null) {
+  limits = l;
   notify();
 }
 
@@ -40,31 +62,70 @@ export function setPanelOpen(open: boolean) {
   panelOpen = open;
 }
 
-export function runningGame(): { appid: number; name: string } {
-  const app = Router.MainRunningApp;
-  return app ? { appid: Number(app.appid) || 0, name: app.display_name || "" } : { appid: 0, name: "" };
+const SHORTCUT_APP_TYPE = 1073741824; // k_EAppType_Shortcut: a non-Steam game added to the library
+
+export function runningGame(): { appid: number; name: string; nonSteam: boolean } {
+  const app = Router.MainRunningApp as any;
+  if (!app) return { appid: 0, name: "", nonSteam: false };
+  return { appid: Number(app.appid) || 0, name: app.display_name || "", nonSteam: app.app_type === SHORTCUT_APP_TYPE };
+}
+
+/** Playtime and unlocked achievements, when the launcher has them. Never blocks for long. */
+async function gameFacts(): Promise<Facts | null> {
+  const app = Router.MainRunningApp as any;
+  if (!app) return null;
+  const game = runningGame();
+  const facts: Facts = { source: game.nonSteam ? "non-steam" : "steam" };
+  if (typeof app.minutes_playtime_forever === "number") facts.playtime_minutes = app.minutes_playtime_forever;
+  if (!game.nonSteam) {
+    try {
+      const store = (window as any).appDetailsStore;
+      if (store?.RequestAchievements) {
+        await Promise.race([store.RequestAchievements(game.appid), new Promise((r) => setTimeout(r, 1500))]);
+      }
+      const a = store?.GetAchievements?.(game.appid);
+      if (a && a.nTotal > 0) {
+        facts.achievements_total = a.nTotal;
+        facts.achievements_unlocked = a.nAchieved;
+        const all = [...(a.vecHighlight || []), ...(a.vecAchievedHidden || []), ...(a.vecUnachieved || [])];
+        const seen = new Set<string>();
+        facts.recent_achievements = all
+          .filter((x: any) => x && x.bAchieved && !seen.has(x.strID) && seen.add(x.strID))
+          .sort((x: any, y: any) => (y.rtUnlocked || 0) - (x.rtUnlocked || 0))
+          .slice(0, 15)
+          .map((x: any) => ({ name: x.strName || x.strID, description: x.strDescription || "" }));
+      }
+    } catch {
+      // achievements are optional
+    }
+  }
+  return facts;
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 function shorten(text: string, max = 230) {
-  const flat = text.replace(/\*\*/g, "").replace(/\s+/g, " ").trim();
+  const flat = api.splitSpoiler(text)[0].replace(/\*\*/g, "").replace(/\s+/g, " ").trim();
   return flat.length > max ? flat.slice(0, max - 1) + "…" : flat;
 }
+
+const DECKY_TAB = 999 as any;
 
 /** Start a request. Screenshots are taken with the menu closed, then the menu reopens. */
 export async function startAsk(question: string, withShot: boolean, mode: api.Mode, origin: api.Origin) {
   const game = runningGame();
+  const factsPromise = gameFacts();
   if (withShot && origin === "panel") {
     reopenAfterCapture = true;
     Navigation.CloseSideMenus();
     await sleep(550);
   }
-  const res = await api.ask(game.appid, game.name, question, withShot, mode, origin);
+  const facts = await factsPromise;
+  const res = await api.ask(game.appid, game.name, question, withShot, mode, origin, facts);
   if (!res.ok) {
     reopenAfterCapture = false;
     toaster.toast({ title: "Deck Mentor", body: res.error || "Не удалось начать запрос" });
-    if (withShot && origin === "panel") Navigation.OpenQuickAccessMenu(999 as any);
+    if (withShot && origin === "panel") Navigation.OpenQuickAccessMenu(DECKY_TAB);
     return;
   }
   setCurrent({
@@ -74,9 +135,17 @@ export async function startAsk(question: string, withShot: boolean, mode: api.Mo
 }
 
 export function handleEvent(ev: BackendEvent) {
+  if (ev.type === "limits") {
+    setLimits(ev.limits);
+    return;
+  }
+  if (ev.type === "download") {
+    download = ev.progress >= 1 ? null : { kind: ev.kind, progress: ev.progress };
+    notify();
+    return;
+  }
   if (!current || current.id !== ev.id) {
-    // The panel may have been closed when the request started (hotkey): adopt it.
-    if (ev.type === "done" && ev.origin === "hotkey") showAnswerToast(ev.answer, ev.error, ev.game);
+    if (ev.type === "done" && ev.origin !== "panel") showAnswerToast(ev.answer, ev.error, ev.game);
     return;
   }
   const next: Request = { ...current };
@@ -94,19 +163,21 @@ export function handleEvent(ev: BackendEvent) {
     case "captured":
       if (reopenAfterCapture) {
         reopenAfterCapture = false;
-        Navigation.OpenQuickAccessMenu(999 as any); // Decky tab
+        Navigation.OpenQuickAccessMenu(DECKY_TAB);
       }
       break;
     case "done":
       Object.assign(next, { done: true, ok: ev.ok, answer: ev.answer, error: ev.error, status: "" });
       if (reopenAfterCapture) {
         reopenAfterCapture = false; // failed before the screenshot: bring the menu back anyway
-        Navigation.OpenQuickAccessMenu(999 as any);
+        Navigation.OpenQuickAccessMenu(DECKY_TAB);
       }
-      if (ev.origin === "hotkey" || !panelOpen) showAnswerToast(ev.answer, ev.error, ev.game, ev.mode);
+      if (ev.origin !== "panel" || !panelOpen) showAnswerToast(ev.answer, ev.error, ev.game, ev.mode);
       break;
   }
-  setCurrent(next);
+  current = next;
+  if (ev.type === "text" || ev.type === "status") notifySoon();
+  else notify();
 }
 
 function showAnswerToast(answer: string, error: string, game: string, mode?: api.Mode) {
@@ -115,21 +186,41 @@ function showAnswerToast(answer: string, error: string, game: string, mode?: api
     title,
     body: answer ? shorten(answer) : error || "Нет ответа",
     duration: answer ? 15000 : 6000,
-    onClick: () => Navigation.OpenQuickAccessMenu(999 as any),
+    onClick: () => Navigation.OpenQuickAccessMenu(DECKY_TAB),
   });
 }
 
-export async function onHotkey() {
-  if (current && !current.done) {
-    toaster.toast({ title: "Deck Mentor", body: "Ещё думаю над прошлым вопросом…", duration: 3000 });
-    return;
-  }
+function toast(body: string, duration = 3000) {
+  toaster.toast({ title: "Deck Mentor", body, duration });
+}
+
+export async function onHotkey(ev: HotkeyEvent) {
+  const kind = ev?.kind || "hint";
+  if (kind === "voice_listening") return toast("🎤 Слушаю… отпустите кнопки, когда договорите", 3000);
+  if (kind === "voice_transcribing") return toast("Распознаю…", 2500);
+  if (kind === "voice_error") return toast((ev as any).text || "Не получилось", 5000);
+
+  if (current && !current.done) return toast("Ещё думаю над прошлым вопросом…");
   const game = runningGame();
-  if (!game.appid) {
-    toaster.toast({ title: "Deck Mentor", body: "Сначала запустите игру.", duration: 3000 });
-    return;
+  if (!game.appid) return toast("Сначала запустите игру.");
+
+  if (kind === "voice") {
+    const text = (ev as any).text as string;
+    toast(`🎤 «${text}»`, 4000);
+    return startAsk(text, true, "quick", "voice");
   }
   const question = settings?.hotkey_question || "Что мне сейчас делать? Подскажи по скриншоту.";
-  toaster.toast({ title: "Deck Mentor", body: "Смотрю на экран…", duration: 2500 });
-  await startAsk(question, true, "quick", "hotkey");
+  toast("Смотрю на экран…", 2500);
+  return startAsk(question, true, "quick", "hotkey");
+}
+
+/** Text shown on the full-screen reader page. */
+export let readerContent: { title: string; text: string } = { title: "", text: "" };
+
+export const READER_ROUTE = "/deck-mentor-reader";
+
+export function openReader(title: string, text: string) {
+  readerContent = { title, text };
+  Navigation.CloseSideMenus();
+  Navigation.Navigate(READER_ROUTE);
 }

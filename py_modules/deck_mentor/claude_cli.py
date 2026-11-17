@@ -184,6 +184,7 @@ async def stream_turn(
                         yield {"type": "tool", "label": describe_tool(block.get("name", ""), block.get("input") or {})}
             elif kind == "rate_limit_event":
                 info = data.get("rate_limit_info") or {}
+                yield {"type": "limits", "info": info}
                 if info.get("status") not in (None, "allowed", "allowed_warning"):
                     yield {"type": "limit", "resetsAt": info.get("resetsAt"), "kind": info.get("rateLimitType")}
             elif kind == "result":

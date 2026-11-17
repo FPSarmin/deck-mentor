@@ -65,19 +65,33 @@ def _find_device() -> str | None:
     return candidates[0][1] if candidates else None
 
 
+class Binding:
+    """A button combination: `on_hold` fires once it is held long enough, `on_release` when let go."""
+
+    def __init__(self, combo: str, hold: float, on_hold: Callable[[], None],
+                 on_release: Callable[[], None] | None = None) -> None:
+        self.buttons = COMBOS.get(combo, COMBOS["L4+R4"])
+        self.hold = max(0.1, hold)
+        self.on_hold = on_hold
+        self.on_release = on_release
+        self.since: float | None = None
+        self.fired = False
+
+
 class HotkeyListener:
-    def __init__(self, on_trigger: Callable[[], None], logger) -> None:
-        self._on_trigger = on_trigger
+    def __init__(self, logger) -> None:
         self._log = logger
-        self._combo = COMBOS["L4+R4"]
-        self._hold = 0.35
+        self._bindings: list[Binding] = []
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self.status = "выключено"
 
-    def configure(self, combo: str, hold_seconds: float = 0.35) -> None:
-        self._combo = COMBOS.get(combo, COMBOS["L4+R4"])
-        self._hold = max(0.1, hold_seconds)
+    def set_bindings(self, bindings: list[Binding]) -> None:
+        self._bindings = bindings
+        if bindings:
+            self.start()
+        else:
+            self.stop()
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -117,30 +131,55 @@ class HotkeyListener:
             finally:
                 os.close(fd)
 
+    def _call(self, fn: Callable[[], None] | None) -> None:
+        if fn:
+            try:
+                fn()
+            except Exception:  # never let a callback kill the listener
+                self._log.exception("hotkey callback failed")
+
+    def feed(self, buttons: set[str], now: float) -> None:
+        for b in list(self._bindings):
+            if b.buttons <= buttons:
+                if b.since is None:
+                    b.since = now
+                elif not b.fired and now - b.since >= b.hold:
+                    b.fired = True
+                    self._call(b.on_hold)
+            else:
+                if b.fired:
+                    self._call(b.on_release)
+                b.since = None
+                b.fired = False
+
+    def _waiting(self) -> bool:
+        return any(b.since is not None and not b.fired for b in self._bindings)
+
     def _loop(self, fd: int) -> None:
-        held_since: float | None = None
-        fired = False
+        """The controller sends hundreds of reports a second; only look at button changes.
+
+        Each wake-up drains everything queued and keeps the newest report, so a busy
+        moment never builds a backlog, and the Python side does almost no work while
+        buttons stay the same.
+        """
+        last, held = b"", set()
         while not self._stop.is_set():
             ready, _, _ = select.select([fd], [], [], 0.2)
-            if not ready:
-                continue
-            try:
-                report = os.read(fd, 64)
-            except BlockingIOError:
-                continue
-            buttons = pressed_buttons(report)
-            if not buttons and report[2:3] != bytes([REPORT_DECK_STATE]):
-                continue
-            if self._combo <= buttons:
-                now = time.monotonic()
-                if held_since is None:
-                    held_since = now
-                elif not fired and now - held_since >= self._hold:
-                    fired = True
+            newest = None
+            if ready:
+                while True:
                     try:
-                        self._on_trigger()
-                    except Exception:  # never let a callback kill the listener
-                        self._log.exception("hotkey callback failed")
-            else:
-                held_since = None
-                fired = False
+                        report = os.read(fd, 64)
+                    except BlockingIOError:
+                        break
+                    if not report:
+                        break
+                    if len(report) >= 16 and report[2] == REPORT_DECK_STATE:
+                        newest = report
+            if newest is not None and newest[8:16] != last:
+                last = newest[8:16]
+                held = pressed_buttons(newest)
+                self.feed(held, time.monotonic())
+            elif self._waiting():
+                self.feed(held, time.monotonic())  # same buttons, but a hold time may have run out
+            time.sleep(0.02)

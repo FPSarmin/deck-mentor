@@ -1,19 +1,14 @@
-import {
-  ButtonItem,
-  DropdownItem,
-  Focusable,
-  PanelSection,
-  PanelSectionRow,
-  Spinner,
-  TextField,
-  ToggleField,
-} from "@decky/ui";
-import { useEffect, useState } from "react";
+import { ButtonItem, DialogButton, Focusable, PanelSection, PanelSectionRow, Spinner, ToggleField } from "@decky/ui";
+import { LazyTextField } from "./Fields";
+import { ReactNode, useEffect, useState } from "react";
 import { useQuickAccessVisible } from "@decky/api";
 import * as api from "./backend";
-import type { CliInfo, State } from "./backend";
+import type { CliInfo, Limits, State } from "./backend";
 import { Answer } from "./Answer";
-import { runningGame, setCachedSettings, setCurrent, setPanelOpen, startAsk, useCurrent } from "./store";
+import { SettingsRows } from "./Settings";
+import {
+  openReader, runningGame, setCachedSettings, setCurrent, setLimits, setPanelOpen, startAsk, useCurrent, useLimits,
+} from "./store";
 
 const QUICK = [
   { label: "📷 Что мне делать?", q: "Что мне сейчас делать? Подскажи по скриншоту.", shot: true },
@@ -24,7 +19,7 @@ const QUICK = [
 
 const box = { padding: "8px 10px", borderRadius: "6px", background: "rgba(255,255,255,0.06)" };
 const small = { fontSize: "12px", opacity: 0.7 };
-const mb = (n: number) => `${(n / 1e6).toFixed(n < 1e7 ? 1 : 0)} МБ`;
+const smallButton = { minWidth: 0, flex: 1, padding: "6px 8px", fontSize: "12px" };
 
 function Setup({ cli, onRetry }: { cli: CliInfo; onRetry: () => void }) {
   const steps = !cli.found
@@ -59,17 +54,84 @@ function Setup({ cli, onRetry }: { cli: CliInfo; onRetry: () => void }) {
   );
 }
 
-function CurrentAnswer() {
+const pad = (n: number) => String(n).padStart(2, "0");
+const MONTHS = ["янв", "фев", "мар", "апр", "мая", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"];
+
+function when(ts: number) {
+  const d = new Date(ts * 1000);
+  const now = new Date();
+  const time = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  return d.toDateString() === now.toDateString() ? time : `${d.getDate()} ${MONTHS[d.getMonth()]} ${time}`;
+}
+
+/** "5 ч: 11% · неделя: 67%" from the last rate-limit event Claude Code reported. */
+function LimitsLine({ limits }: { limits: Limits | null }) {
+  const windows = limits?.windows;
+  if (!windows) return null;
+  const now = Date.now() / 1000;
+  const parts = ([["five_hour", "5 ч"], ["seven_day", "неделя"]] as const)
+    .map(([key, label]) => {
+      const w = windows[key];
+      if (!w || typeof w.utilization !== "number") return null;
+      const reset = w.resets_at && w.resets_at > now;
+      const pct = reset ? Math.round(w.utilization * 100) : 0;
+      const color = pct >= 90 ? "#ff8080" : pct >= 75 ? "#e8b14d" : undefined;
+      return (
+        <span key={key} style={{ color }}>
+          {label}: {pct}%{reset && pct > 0 ? ` (сброс ${when(w.resets_at!)})` : ""}
+        </span>
+      );
+    })
+    .filter(Boolean);
+  if (!parts.length) return null;
+  const blocked = limits?.status && !["allowed", "allowed_warning"].includes(limits.status) && (limits.resets_at || 0) > now;
+  return (
+    <PanelSectionRow>
+      <div style={small}>
+        Лимит подписки: {parts.reduce<ReactNode[]>((acc, p, i) => (i ? [...acc, " · ", p] : [p]), [])}
+        {blocked && <div style={{ color: "#ff8080" }}>Лимит исчерпан до {when(limits!.resets_at!)}</div>}
+      </div>
+    </PanelSectionRow>
+  );
+}
+
+/** Buttons under an answer: full-screen reader and, when TTS is on, read aloud. */
+function AnswerActions({ title, text, shown, full, tts }: { title: string; text: string; shown: string; full: boolean; tts: boolean }) {
+  const [speaking, setSpeaking] = useState(false);
+  const [error, setError] = useState("");
+  const speak = async () => {
+    setError("");
+    if (speaking) {
+      await api.stopSpeaking();
+      setSpeaking(false);
+      return;
+    }
+    setSpeaking(true);
+    const r = await api.speak(shown);
+    setSpeaking(false);
+    if (!r.ok) setError(r.error || "Не получилось озвучить");
+  };
+  return (
+    <>
+      <Focusable style={{ display: "flex", gap: "6px", marginTop: "8px" }}>
+        <DialogButton style={smallButton} onClick={() => openReader(title, full ? shown : text)}>⤢ На весь экран</DialogButton>
+        {tts && <DialogButton style={smallButton} onClick={speak}>{speaking ? "⏹ Стоп" : "🔊 Прочитать"}</DialogButton>}
+      </Focusable>
+      {error && <div style={{ fontSize: "12px", color: "#ff8080", marginTop: "4px" }}>{error}</div>}
+    </>
+  );
+}
+
+function CurrentAnswer({ tts }: { tts: boolean }) {
   const cur = useCurrent();
   if (!cur) return null;
   const busy = !cur.done;
   const text = cur.done ? cur.answer || cur.text : cur.text;
+  const title = cur.mode === "deep" ? "🔬 Глубокий разбор" : cur.question;
   return (
     <PanelSectionRow>
       <div style={box}>
-        <div style={{ ...small, marginBottom: "4px" }}>
-          {cur.mode === "deep" ? "🔬 Глубокий разбор" : `${cur.shot ? "📷 " : ""}${cur.question}`}
-        </div>
+        <div style={{ ...small, marginBottom: "4px" }}>{cur.mode === "deep" ? title : `${cur.shot ? "📷 " : ""}${title}`}</div>
         {busy && (
           <div style={{ display: "flex", alignItems: "center", gap: "8px", ...small, marginBottom: text ? "6px" : 0 }}>
             <Spinner style={{ width: "16px", height: "16px" }} />
@@ -77,10 +139,41 @@ function CurrentAnswer() {
           </div>
         )}
         {cur.warning && <div style={{ ...small, color: "#e8b14d" }}>{cur.warning}</div>}
-        {text && <Answer text={text} dim={busy} />}
+        {text && (
+          <Answer key={cur.id} text={text} dim={busy}
+            actions={cur.done ? (shown, full) => <AnswerActions title={title} text={text} shown={shown} full={full} tts={tts} /> : undefined} />
+        )}
         {cur.done && cur.error && <div style={{ fontSize: "12px", color: "#ff8080", marginTop: "4px", whiteSpace: "pre-wrap" }}>{cur.error}</div>}
       </div>
     </PanelSectionRow>
+  );
+}
+
+/** Push-to-talk inside the panel: first press records, second press transcribes into the question field. */
+function MicButton({ onText, disabled }: { onText: (t: string) => void; disabled: boolean }) {
+  const [phase, setPhase] = useState<"idle" | "rec" | "busy">("idle");
+  const [error, setError] = useState("");
+  const press = async () => {
+    setError("");
+    if (phase === "idle") {
+      const r = await api.voiceRecordStart();
+      if (r.ok) setPhase("rec");
+      else setError(r.error || "Не удалось включить микрофон");
+    } else if (phase === "rec") {
+      setPhase("busy");
+      const r = await api.voiceRecordStop();
+      setPhase("idle");
+      if (r.ok && r.text) onText(r.text);
+      else setError(r.error || "Не расслышал, попробуйте ещё раз");
+    }
+  };
+  return (
+    <>
+      <DialogButton style={{ ...smallButton, flex: "0 0 auto", minWidth: "96px" }} disabled={disabled || phase === "busy"} onClick={press}>
+        {phase === "idle" ? "🎤 Сказать" : phase === "rec" ? "⏹ Готово" : "Распознаю…"}
+      </DialogButton>
+      {error && <div style={{ fontSize: "12px", color: "#ff8080" }}>{error}</div>}
+    </>
   );
 }
 
@@ -90,11 +183,10 @@ export function Panel() {
   const [question, setQuestion] = useState("");
   const [withShot, setWithShot] = useState(true);
   const [notes, setNotesText] = useState("");
-  const [showGuide, setShowGuide] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
-  const [preview, setPreview] = useState<string>("");
   const cur = useCurrent();
+  const limits = useLimits();
   const game = runningGame();
   const busy = !!cur && !cur.done;
 
@@ -103,7 +195,13 @@ export function Panel() {
     setState(s);
     setCachedSettings(s.settings);
     setNotesText(s.game.notes);
+    setLimits(s.limits);
     if (s.current && (!cur || cur.id === s.current.id)) setCurrent(s.current);
+    if (s.settings.update_check) {
+      api.checkUpdate(false)
+        .then((u) => u && setState((st) => (st ? { ...st, update: u } : st)))
+        .catch(() => {});
+    }
   };
   const recheck = async () => setCli(await api.checkCli());
 
@@ -124,6 +222,8 @@ export function Panel() {
 
   const ready = cli?.found && cli.loggedIn;
   const s = state?.settings;
+  const tts = !!s?.tts_enabled && !!state?.voice.tts_voice && !!state?.voice.player;
+  const mic = !!state?.voice.stt_binary && !!state?.voice.stt_model && !!state?.voice.recorder;
   const update = async (patch: Partial<api.Settings>) => {
     const next = await api.setSettings(patch);
     setState((st) => (st ? { ...st, settings: next } : st));
@@ -131,12 +231,24 @@ export function Panel() {
     if ("auth_mode" in patch || "api_key" in patch) recheck();
   };
   const ask = (q: string, shot: boolean) => startAsk(q, shot, "quick", "panel");
+  const upd = state?.update;
 
   return (
     <>
+      {upd?.newer && (
+        <PanelSection title="Обновление">
+          <PanelSectionRow>
+            <ButtonItem layout="below" description={`Установлена ${upd.current}. Decky спросит подтверждение.`}
+              onClick={() => api.installUpdate(upd.url, upd.latest)}>
+              ⬆️ Обновить до {upd.latest}
+            </ButtonItem>
+          </PanelSectionRow>
+        </PanelSection>
+      )}
       {cli && !ready && <Setup cli={cli} onRetry={recheck} />}
       <PanelSection title={game.name || "Игра не запущена"}>
-        <CurrentAnswer />
+        {s?.auth_mode === "subscription" && <LimitsLine limits={limits} />}
+        <CurrentAnswer tts={tts} />
         {busy && (
           <PanelSectionRow>
             <ButtonItem layout="below" onClick={() => api.cancel()}>Остановить</ButtonItem>
@@ -153,16 +265,19 @@ export function Panel() {
           </Focusable>
         </PanelSectionRow>
         <PanelSectionRow>
-          <TextField label="Свой вопрос" value={question} onChange={(e) => setQuestion(e.target.value)} disabled={busy} />
+          <LazyTextField label="Свой вопрос" value={question} onCommit={setQuestion} disabled={busy} />
         </PanelSectionRow>
         <PanelSectionRow>
           <ToggleField label="Приложить скриншот" checked={withShot} disabled={!game.appid} onChange={setWithShot} />
         </PanelSectionRow>
         <PanelSectionRow>
-          <ButtonItem layout="below" disabled={busy || !ready || !question.trim()}
-            onClick={() => { ask(question.trim(), withShot && !!game.appid); setQuestion(""); }}>
-            Спросить
-          </ButtonItem>
+          <Focusable style={{ display: "flex", flexWrap: "wrap", gap: "6px" }}>
+            {mic && <MicButton disabled={busy} onText={(t) => setQuestion((q) => (q.trim() ? `${q.trim()} ${t}` : t))} />}
+            <DialogButton style={{ ...smallButton, fontSize: "14px" }} disabled={busy || !ready || !question.trim()}
+              onClick={() => { ask(question.trim(), withShot && !!game.appid); setQuestion(""); }}>
+              Спросить
+            </DialogButton>
+          </Focusable>
         </PanelSectionRow>
       </PanelSection>
 
@@ -183,29 +298,20 @@ export function Panel() {
           {state?.game.guide && (
             <>
               <PanelSectionRow>
-                <ButtonItem layout="below" onClick={() => setShowGuide(!showGuide)}>
-                  📖 {showGuide ? "Скрыть гайд" : "Открыть гайд"}
+                <ButtonItem layout="below" onClick={() => openReader(`Гайд: ${game.name}`, state.game.guide)}>
+                  📖 Открыть гайд
                 </ButtonItem>
               </PanelSectionRow>
-              {showGuide && (
-                <PanelSectionRow>
-                  <Focusable style={box} onActivate={() => {}}>
-                    <Answer text={state.game.guide} />
-                  </Focusable>
-                </PanelSectionRow>
-              )}
-              {showGuide && (
-                <PanelSectionRow>
-                  <ButtonItem layout="below" onClick={async () => { await api.deleteGuide(game.appid); setShowGuide(false); refresh(); }}>
-                    Удалить гайд
-                  </ButtonItem>
-                </PanelSectionRow>
-              )}
+              <PanelSectionRow>
+                <ButtonItem layout="below" onClick={async () => { await api.deleteGuide(game.appid); refresh(); }}>
+                  Удалить гайд
+                </ButtonItem>
+              </PanelSectionRow>
             </>
           )}
           <PanelSectionRow>
-            <TextField label="Где я сейчас (заметка для Claude)" value={notes} onChange={(e) => setNotesText(e.target.value)}
-              onBlur={() => api.setNotes(game.appid, notes)} />
+            <LazyTextField label="Где я сейчас (заметка для Claude)" value={notes} delay={1500}
+              onCommit={(v) => { setNotesText(v); api.setNotes(game.appid, v); }} />
           </PanelSectionRow>
         </PanelSection>
       )}
@@ -219,10 +325,11 @@ export function Panel() {
           </PanelSectionRow>
           {showHistory && state.game.history.slice().reverse().map((h) => (
             <PanelSectionRow key={h.ts + h.q}>
-              <Focusable style={box} onActivate={() => {}}>
-                <div style={{ ...small, marginBottom: "4px" }}>{h.shot ? "📷 " : ""}{h.q}</div>
-                <Answer text={h.a} dim={!h.ok} />
-              </Focusable>
+              <div style={box}>
+                <div style={{ ...small, marginBottom: "4px" }}>{h.mode === "deep" ? "🔬 " : h.shot ? "📷 " : ""}{h.q || "Глубокий разбор"}</div>
+                <Answer text={h.a} dim={!h.ok}
+                  actions={(shown, full) => <AnswerActions title={h.q || "Глубокий разбор"} text={h.a} shown={shown} full={full} tts={tts} />} />
+              </div>
             </PanelSectionRow>
           ))}
           <PanelSectionRow>
@@ -242,97 +349,7 @@ export function Panel() {
             </ButtonItem>
           </PanelSectionRow>
           {showSettings && (
-            <>
-              <PanelSectionRow>
-                <DropdownItem label="Спойлеры" selectedOption={s.spoiler} onChange={(o) => update({ spoiler: o.data })}
-                  rgOptions={[
-                    { data: "hint", label: "Только намёки" },
-                    { data: "balanced", label: "Помощь без лишнего" },
-                    { data: "full", label: "Полное решение" },
-                  ]} />
-              </PanelSectionRow>
-              <PanelSectionRow>
-                <DropdownItem label="Модель" selectedOption={s.model} onChange={(o) => update({ model: o.data })}
-                  rgOptions={[
-                    { data: "opus", label: "Opus (умнее всех)" },
-                    { data: "sonnet", label: "Sonnet (быстрее)" },
-                    { data: "haiku", label: "Haiku (самый быстрый)" },
-                  ]} />
-              </PanelSectionRow>
-              <PanelSectionRow>
-                <DropdownItem label="Глубина размышлений" selectedOption={s.effort} onChange={(o) => update({ effort: o.data })}
-                  rgOptions={[
-                    { data: "low", label: "Быстро" },
-                    { data: "medium", label: "Обычно" },
-                    { data: "high", label: "Тщательно" },
-                  ]} />
-              </PanelSectionRow>
-              <PanelSectionRow>
-                <ToggleField label="Искать в интернете" description="Вики и гайды для точных ответов"
-                  checked={s.web_search} onChange={(v) => update({ web_search: v })} />
-              </PanelSectionRow>
-              <PanelSectionRow>
-                <ToggleField label="Горячая клавиша" description={`Зажмите кнопки — Claude посмотрит на экран и ответит уведомлением. Статус: ${state.hotkey_status}`}
-                  checked={s.hotkey_enabled} onChange={(v) => update({ hotkey_enabled: v })} />
-              </PanelSectionRow>
-              {s.hotkey_enabled && (
-                <PanelSectionRow>
-                  <DropdownItem label="Кнопки" selectedOption={s.hotkey_combo} onChange={(o) => update({ hotkey_combo: o.data })}
-                    rgOptions={state.combos.map((c) => ({ data: c, label: c }))} />
-                </PanelSectionRow>
-              )}
-              {s.hotkey_enabled && (
-                <PanelSectionRow>
-                  <TextField label="Вопрос для горячей клавиши" value={s.hotkey_question}
-                    onChange={(e) => setState({ ...state, settings: { ...s, hotkey_question: e.target.value } })}
-                    onBlur={() => update({ hotkey_question: s.hotkey_question })} />
-                </PanelSectionRow>
-              )}
-              <PanelSectionRow>
-                <DropdownItem label="Вход" selectedOption={s.auth_mode} onChange={(o) => update({ auth_mode: o.data })}
-                  rgOptions={[
-                    { data: "subscription", label: "Подписка Claude" },
-                    { data: "api_key", label: "API-ключ" },
-                  ]} />
-              </PanelSectionRow>
-              {s.auth_mode === "api_key" && (
-                <PanelSectionRow>
-                  <TextField label="API-ключ Anthropic" bIsPassword value={s.api_key}
-                    onChange={(e) => setState({ ...state, settings: { ...s, api_key: e.target.value } })}
-                    onBlur={() => update({ api_key: s.api_key })} />
-                </PanelSectionRow>
-              )}
-              <PanelSectionRow>
-                <div style={small}>
-                  {cli?.found ? `Claude Code ${cli.version || ""} · ${cli.loggedIn ? "вход выполнен" : "нет входа"}` : "Claude Code не найден"}
-                </div>
-              </PanelSectionRow>
-              <PanelSectionRow>
-                <DropdownItem label="Хранить переписку" selectedOption={s.keep_days} onChange={(o) => update({ keep_days: o.data })}
-                  rgOptions={[{ data: 0, label: "Всегда" }, ...[7, 30, 90].map((d) => ({ data: d, label: `${d} дн.` }))]} />
-              </PanelSectionRow>
-              <PanelSectionRow>
-                <ButtonItem layout="below" disabled={busy} description={`Плагин занимает ${mb(state.storage_bytes)} вместе с перепиской. Удалит копии сейвов, черновики и резервные копии; переписка, гайды и заметки останутся.`}
-                  onClick={async () => { await api.cleanupNow(false); refresh(); }}>
-                  Очистить временные файлы
-                </ButtonItem>
-              </PanelSectionRow>
-              <PanelSectionRow>
-                <ButtonItem layout="below" onClick={async () => {
-                  const r = await api.testCapture();
-                  setPreview(r.ok ? r.data_url! : `error:${r.error}`);
-                }}>
-                  Проверить скриншот
-                </ButtonItem>
-              </PanelSectionRow>
-              {preview && (
-                <PanelSectionRow>
-                  {preview.startsWith("error:")
-                    ? <div style={{ fontSize: "12px", color: "#ff8080" }}>{preview.slice(6)}</div>
-                    : <img src={preview} style={{ width: "100%", borderRadius: "4px" }} />}
-                </PanelSectionRow>
-              )}
-            </>
+            <SettingsRows state={state} cli={cli} busy={busy} update={update} refresh={refresh} />
           )}
         </PanelSection>
       )}

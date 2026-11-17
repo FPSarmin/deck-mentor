@@ -21,6 +21,12 @@ def main():
                 if f.endswith(".py"):
                     path = os.path.join(base, f)
                     zf.write(path, f"{NAME}/{os.path.relpath(path, ROOT)}")
+        # Speech recogniser built in CI (Decky drops exec bits; voice.py restores them on a copy).
+        whisper = os.path.join(ROOT, "bin", "whisper-cli")
+        if os.path.isfile(whisper):
+            zf.write(whisper, f"{NAME}/bin/whisper-cli")
+        else:
+            print("note: bin/whisper-cli not found, building without voice input")
     print(f"{target} (v{version}, {os.path.getsize(target) // 1024} KB)")
 
 
