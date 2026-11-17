@@ -1,0 +1,11 @@
+{
+  "name": "Deck Mentor",
+  "author": "FPSarmin",
+  "flags": [],
+  "api_version": 1,
+  "publish": {
+    "tags": ["ai", "guide", "assistant"],
+    "description": "Ask Claude for help with the game you are playing: screenshots, save analysis, hotkey.",
+    "image": ""
+  }
+}

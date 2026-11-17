@@ -1,0 +1,401 @@
+"""Deck Mentor: ask Claude for game help on the Steam Deck.
+
+The frontend (src/index.tsx) calls the async methods of `Plugin`; progress is
+pushed back with `decky.emit(EVENT, payload)`.
+"""
+
+import asyncio
+import base64
+import os
+import sys
+import time
+import uuid
+
+import decky
+
+_PY_MODULES = os.path.join(decky.DECKY_PLUGIN_DIR, "py_modules")
+if _PY_MODULES not in sys.path:
+    sys.path.insert(0, _PY_MODULES)
+
+from deck_mentor import capture, claude_cli, cleanup, games, prompts  # noqa: E402
+from deck_mentor.hotkey import COMBOS, HotkeyListener  # noqa: E402
+from deck_mentor.store import GameState, Settings  # noqa: E402
+
+EVENT = "deck_mentor_event"
+HOTKEY_EVENT = "deck_mentor_hotkey"
+QUICK_TIMEOUT = 240
+DEEP_TIMEOUT = 1500
+CLEANUP_EVERY = 6 * 3600
+
+NOT_LOGGED_IN = (
+    "Claude Code не вошёл в аккаунт. В режиме рабочего стола откройте Konsole, "
+    "выполните `claude`, затем `/login` и войдите с подпиской."
+)
+NOT_INSTALLED = (
+    "Claude Code не установлен. В режиме рабочего стола откройте Konsole и выполните:\n"
+    "curl -fsSL https://claude.ai/install.sh | bash"
+)
+
+
+class Plugin:
+    # ------------------------------------------------------------------ setup
+    def _ensure(self):
+        if getattr(self, "_ready", False):
+            return
+        self.loop = asyncio.get_running_loop()
+        self.settings = Settings(decky.DECKY_PLUGIN_SETTINGS_DIR)
+        self.games_dir = os.path.join(decky.DECKY_PLUGIN_RUNTIME_DIR, "games")
+        os.makedirs(self.games_dir, exist_ok=True)
+        self.projects_dir = cleanup.default_projects_dir()
+        self.task = None
+        self.proc = None
+        self.current = None
+        self.cli_info = None
+        self.last_cleanup = 0.0
+        self.hotkey = HotkeyListener(self._hotkey_from_thread, decky.logger)
+        self._ready = True
+
+    async def _main(self):
+        self._ensure()
+        self._apply_hotkey()
+        while True:
+            try:
+                await self._cleanup()
+            except Exception:
+                decky.logger.exception("cleanup failed")
+            await asyncio.sleep(CLEANUP_EVERY)
+
+    async def _unload(self):
+        if getattr(self, "_ready", False):
+            self.hotkey.stop()
+            await self.cancel()
+
+    async def _uninstall(self):
+        if getattr(self, "_ready", False):
+            await self.cleanup_now(True)
+
+    # ---------------------------------------------------------------- helpers
+    def _game(self, appid) -> GameState:
+        return GameState(self.games_dir, int(appid or 0))
+
+    def _all_states(self):
+        states = []
+        for name in os.listdir(self.games_dir):
+            if name.isdigit():
+                states.append(GameState(self.games_dir, int(name)))
+        return states
+
+    def _api_key(self) -> str:
+        return self.settings["api_key"] if self.settings["auth_mode"] == "api_key" else ""
+
+    async def _emit(self, payload: dict):
+        await decky.emit(EVENT, payload)
+
+    def _hotkey_from_thread(self):
+        self.loop.call_soon_threadsafe(lambda: asyncio.ensure_future(decky.emit(HOTKEY_EVENT)))
+
+    def _apply_hotkey(self):
+        self.hotkey.configure(self.settings["hotkey_combo"])
+        if self.settings["hotkey_enabled"]:
+            self.hotkey.start()
+        else:
+            self.hotkey.stop()
+
+    async def _cleanup(self, everything: bool = False) -> int:
+        if self.task and not self.task.done():
+            return 0
+        states = self._all_states()
+        active = {s.data.get("session_id") for s in states if s.data.get("session_id")}
+        known = {sid for s in states for sid in s.data.get("sessions", [])}
+        freed = await asyncio.to_thread(
+            cleanup.clean, self.projects_dir, self.games_dir,
+            float(self.settings["keep_days"]), int(self.settings["max_storage_mb"]) * 1_000_000,
+            active, known, everything,
+        )
+        if everything:
+            for state in states:
+                state.data.update(session_id=None, turns=0, shots=0, sessions=[])
+                state.save()
+        self.last_cleanup = time.time()
+        if freed:
+            decky.logger.info("cleanup freed %.1f MB", freed / 1e6)
+        return freed
+
+    # ------------------------------------------------------- frontend methods
+    async def get_state(self, appid=0):
+        self._ensure()
+        state = self._game(appid)
+        guide = state.guide()
+        usage = await asyncio.to_thread(cleanup.usage, self.projects_dir, self.games_dir)
+        return {
+            "settings": self.settings.public(),
+            "combos": list(COMBOS.keys()),
+            "busy": bool(self.task and not self.task.done()),
+            "current": self.current,
+            "hotkey_status": self.hotkey.status,
+            "storage_bytes": usage,
+            "game": {
+                "notes": state.data.get("notes", ""),
+                "history": state.data.get("history", [])[-12:],
+                "guide": guide,
+                "turns": state.data.get("turns", 0),
+            },
+        }
+
+    async def check_cli(self):
+        self._ensure()
+        path = claude_cli.find_claude(self.settings["claude_path"])
+        info = await claude_cli.status(path, self._api_key())
+        if info.get("projectsDirectory"):
+            self.projects_dir = info["projectsDirectory"]
+        self.cli_info = info
+        return info
+
+    async def set_settings(self, patch):
+        self._ensure()
+        patch = dict(patch or {})
+        if patch.get("api_key", "").startswith("••••"):
+            patch.pop("api_key")
+        if "hotkey_combo" in patch and patch["hotkey_combo"] not in COMBOS:
+            patch.pop("hotkey_combo")
+        data = self.settings.update(patch)
+        if {"hotkey_enabled", "hotkey_combo"} & patch.keys():
+            self.hotkey.stop()
+            self._apply_hotkey()
+        if {"auth_mode", "api_key", "claude_path"} & patch.keys():
+            self.cli_info = None
+        return self.settings.public() if data else {}
+
+    async def set_notes(self, appid, notes):
+        self._ensure()
+        state = self._game(appid)
+        state.data["notes"] = str(notes)[:4000]
+        state.save()
+        return True
+
+    async def delete_guide(self, appid):
+        self._ensure()
+        try:
+            os.remove(self._game(appid).guide_path)
+        except OSError:
+            pass
+        return True
+
+    async def new_chat(self, appid):
+        self._ensure()
+        state = self._game(appid)
+        state.reset_chat()
+        state.save()
+        await self._cleanup()
+        return True
+
+    async def cleanup_now(self, everything=False):
+        self._ensure()
+        freed = await self._cleanup(bool(everything))
+        usage = await asyncio.to_thread(cleanup.usage, self.projects_dir, self.games_dir)
+        return {"freed_bytes": freed, "storage_bytes": usage}
+
+    async def test_capture(self):
+        self._ensure()
+        try:
+            png, w, h = await capture.capture_png()
+        except capture.CaptureError as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "width": w, "height": h, "bytes": len(png),
+                "data_url": "data:image/png;base64," + base64.b64encode(png).decode()}
+
+    async def cancel(self):
+        self._ensure()
+        if self.proc and self.proc.returncode is None:
+            try:
+                self.proc.kill()
+            except ProcessLookupError:
+                pass
+        if self.task and not self.task.done():
+            self.task.cancel()
+        return True
+
+    async def ask(self, appid, game_name, question, with_shot=False, mode="quick", origin="panel"):
+        """Start a request. mode: quick | deep. origin: panel | hotkey."""
+        self._ensure()
+        if self.task and not self.task.done():
+            return {"ok": False, "error": "Я ещё отвечаю на прошлый вопрос."}
+        request_id = uuid.uuid4().hex[:12]
+        self.current = {
+            "id": request_id, "appid": int(appid or 0), "game": game_name or "", "question": question or "",
+            "mode": mode, "origin": origin, "shot": bool(with_shot), "text": "", "tools": [],
+            "status": "Запускаю…", "done": False, "ok": False, "answer": "", "error": "",
+            "started": time.time(),
+        }
+        self.task = self.loop.create_task(self._run(request_id, int(appid or 0), game_name or "",
+                                                    question or "", bool(with_shot), mode, origin))
+        return {"ok": True, "request_id": request_id}
+
+    # -------------------------------------------------------------- the work
+    async def _status(self, rid, text):
+        self.current["status"] = text
+        await self._emit({"id": rid, "type": "status", "text": text})
+
+    async def _finish(self, rid, ok, answer="", error=""):
+        cur = self.current
+        cur.update(done=True, ok=ok, answer=answer, error=error, status="")
+        await self._emit({"id": rid, "type": "done", "ok": ok, "answer": answer, "error": error,
+                          "origin": cur["origin"], "mode": cur["mode"], "game": cur["game"]})
+
+    async def _run(self, rid, appid, game_name, question, with_shot, mode, origin):
+        state = self._game(appid)
+        deep = mode == "deep"
+        try:
+            claude = claude_cli.find_claude(self.settings["claude_path"])
+            if not claude:
+                await self._finish(rid, False, error=NOT_INSTALLED)
+                return
+
+            png_b64 = None
+            if with_shot:
+                await self._status(rid, "Делаю скриншот…")
+                try:
+                    png, _w, _h = await capture.capture_png()
+                    png_b64 = base64.b64encode(png).decode()
+                except capture.CaptureError as exc:
+                    await self._emit({"id": rid, "type": "warning", "text": str(exc)})
+                await self._emit({"id": rid, "type": "captured", "ok": bool(png_b64)})
+
+            os.makedirs(state.dir, exist_ok=True)
+            spoiler = self.settings["spoiler"]
+            context = prompts.context_block(game_name, appid or None, spoiler, state.data.get("notes", ""),
+                                            "" if deep else state.guide(), quick=(origin == "hotkey"))
+
+            web = ["WebSearch", "WebFetch"] if self.settings["web_search"] else []
+            tools, allowed = list(web), list(web)
+            extra_args = []
+            if deep:
+                await self._status(rid, "Копирую сохранения…")
+                saves_dir = os.path.join(state.dir, "saves")
+                cleanup.remove_path(saves_dir)
+                copied = await asyncio.to_thread(games.copy_saves, appid, saves_dir)
+                os.makedirs(os.path.join(state.dir, "scratch"), exist_ok=True)
+                install = await asyncio.to_thread(games.install_dir, appid) if appid else None
+                if install:
+                    extra_args += ["--add-dir", install]
+                tools = ["Read", "Glob", "Grep", "Bash", "Write", "Edit"] + web
+                # Writes only inside the game's workspace; Bash only for python3 scripts
+                # (Claude Code still auto-allows read-only commands such as ls or strings).
+                allowed = ["Read", "Glob", "Grep", "Edit(./**)", "Write(./**)",
+                           "Bash(python3 *)", "Bash(rm -rf ./scratch)"] + web
+                text = prompts.deep_task(game_name, install, spoiler, bool(copied["sources"]), question)
+                effort = "medium" if self.settings["effort"] == "low" else self.settings["effort"]
+                max_turns = int(self.settings["deep_max_turns"])
+                timeout = DEEP_TIMEOUT
+            else:
+                text = question or "Что мне сейчас делать?"
+                effort = self.settings["effort"]
+                max_turns = 8
+                timeout = QUICK_TIMEOUT
+
+            message = claude_cli.user_message(context + "\n\n" + text, png_b64)
+            env = claude_cli.cli_env(self._api_key())
+
+            for attempt in range(2):
+                new_session = state.needs_new_session() or attempt == 1
+                session_args = []
+                if new_session:
+                    state.start_session(str(uuid.uuid4()))
+                    session_args = ["--session-id", state.data["session_id"]]
+                else:
+                    session_args = ["--resume", state.data["session_id"]]
+
+                args = [
+                    "--model", self.settings["model"],
+                    "--effort", effort,
+                    "--system-prompt", prompts.SYSTEM_PROMPT,
+                    "--tools", ",".join(tools),
+                    "--permission-mode", "dontAsk",
+                    "--max-turns", str(max_turns),
+                    "--strict-mcp-config",
+                    "--disable-slash-commands",
+                    *session_args,
+                    *extra_args,
+                ]
+                if allowed:
+                    args += ["--allowedTools", *allowed]
+
+                await self._status(rid, "Разбираю сохранения и файлы игры…" if deep else "Думаю…")
+                result = await self._stream(rid, claude, args, message, state.dir, env, timeout)
+                missing_session = (not result.get("ok")) and "conversation" in result.get("text", "").lower() \
+                    and not new_session
+                if missing_session:
+                    continue  # transcript was cleaned up: start a fresh session once
+                break
+
+            ok = bool(result.get("ok"))
+            answer = result.get("text", "").strip()
+            error = ""
+            if not ok:
+                error = self._explain_error(result)
+                answer = self.current.get("text", "").strip() if result.get("subtype") == "error_max_turns" else ""
+                if answer:
+                    error = "Не хватило шагов, ответ может быть неполным."
+            state.data["turns"] = state.data.get("turns", 0) + 1
+            if png_b64:
+                state.data["shots"] = state.data.get("shots", 0) + 1
+            label = question if not deep else ("Глубокий разбор" + (f": {question}" if question else ""))
+            state.record(label, answer or error, bool(png_b64), mode, ok)
+            state.save()
+            await self._finish(rid, ok or bool(answer), answer=answer, error=error)
+        except asyncio.CancelledError:
+            await self._finish(rid, False, error="Отменено.")
+        except asyncio.TimeoutError:
+            await self._finish(rid, False, error="Claude не ответил вовремя. Попробуйте ещё раз.")
+        except Exception as exc:
+            decky.logger.exception("request failed")
+            await self._finish(rid, False, error=f"Ошибка: {exc}")
+        finally:
+            self.proc = None
+            if deep:
+                cleanup.remove_path(os.path.join(state.dir, "saves"))
+                cleanup.remove_path(os.path.join(state.dir, "scratch"))
+            try:
+                await self._cleanup()
+            except Exception:
+                decky.logger.exception("cleanup failed")
+
+    async def _stream(self, rid, claude, args, message, cwd, env, timeout):
+        def keep(proc):
+            self.proc = proc
+
+        result = {"ok": False, "text": "", "subtype": "crash"}
+        limit_hit = None
+        async for event in claude_cli.stream_turn(claude, args, message, cwd, env, timeout, keep):
+            kind = event["type"]
+            if kind == "text":
+                if self.current["text"] and event.get("message", 0) > self.current.get("_msg", 0):
+                    self.current["text"] += "\n\n"
+                    await self._emit({"id": rid, "type": "text", "delta": "\n\n"})
+                self.current["_msg"] = event.get("message", 0)
+                self.current["text"] += event["delta"]
+                await self._emit({"id": rid, "type": "text", "delta": event["delta"]})
+            elif kind == "tool":
+                self.current["tools"].append(event["label"])
+                await self._status(rid, event["label"])
+            elif kind == "limit":
+                limit_hit = event
+            elif kind == "result":
+                result = event
+        if limit_hit and not result.get("ok"):
+            result["limit"] = limit_hit
+        return result
+
+    @staticmethod
+    def _explain_error(result) -> str:
+        text = (result.get("text") or "").strip()
+        low = text.lower()
+        if result.get("limit"):
+            resets = result["limit"].get("resetsAt")
+            when = time.strftime("%H:%M", time.localtime(resets)) if resets else "позже"
+            return f"Лимит подписки исчерпан. Сброс примерно в {when}."
+        if "login" in low or "authenticat" in low or "invalid api key" in low or "oauth" in low:
+            return NOT_LOGGED_IN
+        if result.get("subtype") == "error_max_turns":
+            return "Не хватило шагов на ответ. Попробуйте сузить вопрос."
+        return text[:500] or "Claude вернул ошибку без описания."
