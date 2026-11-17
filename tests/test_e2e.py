@@ -41,13 +41,15 @@ async def run():
     assert "text" in kinds and "done" in kinds and "captured" in kinds, kinds
 
     sid = p._game(42).data["session_id"]
-    await p.ask(42, "Test Game", "А какой я задал прошлый вопрос?", False, "quick", "hotkey")
+    await p.ask(42, "Test Game", "А какой я задал прошлый вопрос?", False, "quick", "hotkey",
+                {"source": "non-steam", "playtime_minutes": 90})
     cur = await wait(p)
     print("Q2:", cur["ok"], repr(cur["answer"][:200]), cur["error"])
     assert p._game(42).data["session_id"] == sid, "second turn should resume the same session"
 
     state = await p.get_state(42)
     print("history:", len(state["game"]["history"]), "storage MB:", round(state["storage_bytes"] / 1e6, 2))
+    print("limits:", state["limits"])
     transcripts = glob.glob(os.path.join(p.projects_dir, "*", sid + ".jsonl"))
     assert transcripts, "transcript expected"
 

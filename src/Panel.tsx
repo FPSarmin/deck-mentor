@@ -1,6 +1,6 @@
 import { ButtonItem, DialogButton, Focusable, PanelSection, PanelSectionRow, Spinner, ToggleField } from "@decky/ui";
 import { LazyTextField } from "./Fields";
-import { ReactNode, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import { useQuickAccessVisible } from "@decky/api";
 import * as api from "./backend";
 import type { CliInfo, Limits, State } from "./backend";
@@ -88,7 +88,7 @@ function LimitsLine({ limits }: { limits: Limits | null }) {
   return (
     <PanelSectionRow>
       <div style={small}>
-        Лимит подписки: {parts.reduce<ReactNode[]>((acc, p, i) => (i ? [...acc, " · ", p] : [p]), [])}
+        Лимит подписки: {parts.flatMap((p, i) => (i ? [<span key={`sep${i}`}> · </span>, p] : [p]))}
         {blocked && <div style={{ color: "#ff8080" }}>Лимит исчерпан до {when(limits!.resets_at!)}</div>}
       </div>
     </PanelSectionRow>
@@ -169,10 +169,10 @@ function MicButton({ onText, disabled }: { onText: (t: string) => void; disabled
   };
   return (
     <>
-      <DialogButton style={{ ...smallButton, flex: "0 0 auto", minWidth: "96px" }} disabled={disabled || phase === "busy"} onClick={press}>
+      <DialogButton style={{ ...smallButton, flex: "0 0 42%", width: "42%" }} disabled={disabled || phase === "busy"} onClick={press}>
         {phase === "idle" ? "🎤 Сказать" : phase === "rec" ? "⏹ Готово" : "Распознаю…"}
       </DialogButton>
-      {error && <div style={{ fontSize: "12px", color: "#ff8080" }}>{error}</div>}
+      {error && <div style={{ fontSize: "12px", color: "#ff8080", flexBasis: "100%", order: 2 }}>{error}</div>}
     </>
   );
 }
@@ -273,7 +273,7 @@ export function Panel() {
         <PanelSectionRow>
           <Focusable style={{ display: "flex", flexWrap: "wrap", gap: "6px" }}>
             {mic && <MicButton disabled={busy} onText={(t) => setQuestion((q) => (q.trim() ? `${q.trim()} ${t}` : t))} />}
-            <DialogButton style={{ ...smallButton, fontSize: "14px" }} disabled={busy || !ready || !question.trim()}
+            <DialogButton style={{ ...smallButton, width: "auto", fontSize: "14px" }} disabled={busy || !ready || !question.trim()}
               onClick={() => { ask(question.trim(), withShot && !!game.appid); setQuestion(""); }}>
               Спросить
             </DialogButton>
