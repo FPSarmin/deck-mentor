@@ -57,9 +57,12 @@ def usage(projects_dir: str, games_dir: str) -> int:
 
 def clean(projects_dir: str, games_dir: str, keep_days: float, max_bytes: int,
           active_sessions: set[str], known_sessions: set[str], everything: bool = False) -> int:
-    """Delete old transcripts, backups and scratch data. Returns bytes freed."""
+    """Delete scratch data and backups; transcripts only if a retention limit is set.
+
+    keep_days <= 0 and max_bytes <= 0 mean "keep transcripts forever". Returns bytes freed.
+    """
     freed = 0
-    cutoff = time.time() - keep_days * 86400
+    cutoff = time.time() - keep_days * 86400 if keep_days > 0 else 0.0
     file_history = os.path.join(os.path.dirname(projects_dir), "file-history")
 
     items = []
@@ -83,7 +86,7 @@ def clean(projects_dir: str, games_dir: str, keep_days: float, max_bytes: int,
              for _m, sid, paths in keep}
     total = sum(sizes.values())
     for _mtime, sid, paths in keep:
-        if total <= max_bytes:
+        if max_bytes <= 0 or total <= max_bytes:
             break
         if sid in active_sessions:
             continue

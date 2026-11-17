@@ -18,12 +18,12 @@ DEFAULT_SETTINGS: dict = {
     "hotkey_enabled": True,
     "hotkey_combo": "L4+R4",
     "hotkey_question": "Что мне сейчас делать? Подскажи по скриншоту.",
-    "keep_days": 3,                 # chat transcripts older than this are deleted
-    "max_storage_mb": 300,
+    "keep_days": 0,                 # 0 = keep chat transcripts forever
+    "max_storage_mb": 0,            # 0 = no size cap on transcripts
     "deep_max_turns": 40,
 }
 
-HISTORY_LIMIT = 30
+HISTORY_LIMIT = 2000  # Q&A text per game; tiny, kept for good
 # Every resumed turn re-sends earlier screenshots, so start a fresh session now and then.
 SESSION_MAX_TURNS = 16
 SESSION_MAX_SHOTS = 6
@@ -108,4 +108,5 @@ class GameState:
         return entry
 
     def reset_chat(self) -> None:
-        self.data.update(session_id=None, turns=0, shots=0, history=[])
+        """Start a fresh conversation for Claude; the visible history is kept."""
+        self.data.update(session_id=None, turns=0, shots=0)

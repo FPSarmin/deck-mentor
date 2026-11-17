@@ -87,6 +87,14 @@ def test_cleanup():
         assert freed >= 1000
         cleanup.clean(projects, games_dir, 3, 1500, {"cur"}, set())
         assert not os.path.exists(new) and os.path.exists(cur)
+        # Defaults: keep transcripts forever, still drop scratch data.
+        with open(new, "w") as fh:
+            fh.write("x")
+        os.utime(new, (past, past))
+        os.makedirs(os.path.join(games_dir, "123", "saves"))
+        cleanup.clean(projects, games_dir, 0, 0, set(), set())
+        assert os.path.exists(new) and os.path.exists(cur)
+        assert not os.path.exists(os.path.join(games_dir, "123", "saves"))
 
 
 def test_copy_saves():

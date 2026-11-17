@@ -56,7 +56,7 @@ export interface State {
   current: Request | null;
   hotkey_status: string;
   storage_bytes: number;
-  game: { notes: string; history: HistoryEntry[]; guide: string; turns: number };
+  game: { notes: string; history: HistoryEntry[]; history_total: number; guide: string; turns: number };
 }
 
 export interface CliInfo {

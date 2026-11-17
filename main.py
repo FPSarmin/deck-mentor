@@ -136,7 +136,8 @@ class Plugin:
             "storage_bytes": usage,
             "game": {
                 "notes": state.data.get("notes", ""),
-                "history": state.data.get("history", [])[-12:],
+                "history": state.data.get("history", [])[-30:],
+                "history_total": len(state.data.get("history", [])),
                 "guide": guide,
                 "turns": state.data.get("turns", 0),
             },

@@ -214,10 +214,10 @@ export function Panel() {
         <PanelSection title="История">
           <PanelSectionRow>
             <ButtonItem layout="below" onClick={() => setShowHistory(!showHistory)}>
-              {showHistory ? "Скрыть" : `Прошлые ответы (${state.game.history.length})`}
+              {showHistory ? "Скрыть" : `Прошлые ответы (${state.game.history_total})`}
             </ButtonItem>
           </PanelSectionRow>
-          {showHistory && state.game.history.slice().reverse().slice(0, 8).map((h) => (
+          {showHistory && state.game.history.slice().reverse().map((h) => (
             <PanelSectionRow key={h.ts + h.q}>
               <Focusable style={box} onActivate={() => {}}>
                 <div style={{ ...small, marginBottom: "4px" }}>{h.shot ? "📷 " : ""}{h.q}</div>
@@ -309,11 +309,11 @@ export function Panel() {
               </PanelSectionRow>
               <PanelSectionRow>
                 <DropdownItem label="Хранить переписку" selectedOption={s.keep_days} onChange={(o) => update({ keep_days: o.data })}
-                  rgOptions={[1, 3, 7, 14].map((d) => ({ data: d, label: `${d} дн.` }))} />
+                  rgOptions={[{ data: 0, label: "Всегда" }, ...[7, 30, 90].map((d) => ({ data: d, label: `${d} дн.` }))]} />
               </PanelSectionRow>
               <PanelSectionRow>
-                <ButtonItem layout="below" disabled={busy} description={`Сейчас занято ${mb(state.storage_bytes)}. Гайды и заметки сохранятся.`}
-                  onClick={async () => { await api.cleanupNow(true); refresh(); }}>
+                <ButtonItem layout="below" disabled={busy} description={`Плагин занимает ${mb(state.storage_bytes)} вместе с перепиской. Удалит копии сейвов, черновики и резервные копии; переписка, гайды и заметки останутся.`}
+                  onClick={async () => { await api.cleanupNow(false); refresh(); }}>
                   Очистить временные файлы
                 </ButtonItem>
               </PanelSectionRow>
