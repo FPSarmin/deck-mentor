@@ -4,7 +4,8 @@ import { FaRegLightbulb } from "react-icons/fa";
 import * as api from "./backend";
 import { Panel } from "./Panel";
 import { Reader } from "./Reader";
-import { handleEvent, onHotkey, READER_ROUTE, setCachedSettings } from "./store";
+import { Tracker } from "./Tracker";
+import { handleEvent, onHotkey, READER_ROUTE, setCachedSettings, TRACKER_ROUTE } from "./store";
 
 export default definePlugin(() => {
   const eventListener = api.onEvent(handleEvent);
@@ -12,6 +13,7 @@ export default definePlugin(() => {
     onHotkey(ev);
   });
   routerHook.addRoute(READER_ROUTE, Reader, { exact: true });
+  routerHook.addRoute(TRACKER_ROUTE, Tracker, { exact: true });
   api.getState(0).then((s) => setCachedSettings(s.settings)).catch(() => {});
 
   return {
@@ -23,6 +25,7 @@ export default definePlugin(() => {
       removeEventListener(api.EVENT, eventListener);
       removeEventListener(api.HOTKEY_EVENT, hotkeyListener);
       routerHook.removeRoute(READER_ROUTE);
+      routerHook.removeRoute(TRACKER_ROUTE);
     },
   };
 });

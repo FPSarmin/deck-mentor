@@ -1,6 +1,6 @@
 {
   "name": "deck-mentor",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "Ask Claude for game walkthrough help on Steam Deck, with screenshots, save analysis and a hotkey",
   "type": "module",
   "scripts": {

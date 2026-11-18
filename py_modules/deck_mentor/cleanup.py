@@ -101,7 +101,7 @@ def clean(projects_dir: str, games_dir: str, keep_days: float, max_bytes: int,
 
     # Leftovers of deep analyses.
     for game_dir in glob.glob(os.path.join(games_dir, "*")):
-        for name in ("saves", "scratch"):
+        for name in ("saves", "scratch", "track-saves"):
             freed += remove_path(os.path.join(game_dir, name))
 
     for proj in project_dirs(projects_dir, games_dir):

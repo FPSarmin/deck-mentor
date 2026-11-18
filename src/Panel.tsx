@@ -9,7 +9,7 @@ import type { CliInfo, Limits, Mode, State } from "./backend";
 import { Answer } from "./Answer";
 import { SettingsRows } from "./Settings";
 import {
-  achievementSummary, openReader, panelUi, runningGame, setCachedSettings, setCurrent, setLimits, setPanelOpen, startAsk,
+  achievementSummary, openReader, openTracker, panelUi, runningGame, setCachedSettings, setCurrent, setLimits, setPanelOpen, startAsk,
   useCurrent, useLimits,
 } from "./store";
 
@@ -239,11 +239,11 @@ function CurrentAnswer({ tts, onFollowup, canAsk }: { tts: boolean; onFollowup: 
   if (!cur) return null;
   const busy = !cur.done;
   const text = api.stripNext(cur.done ? cur.answer || cur.text : cur.text);
-  const title = cur.mode === "deep" ? "🔬 Глубокий разбор" : cur.question;
+  const title = cur.mode === "deep" ? "🔬 Глубокий разбор" : cur.mode === "tracker" ? "📋 Трекер" : cur.question;
   return (
     <PanelSectionRow>
       <div style={box}>
-        <div style={{ ...small, marginBottom: "4px" }}>{cur.mode === "deep" ? title : `${cur.shot ? "📷 " : ""}${title}`}</div>
+        <div style={{ ...small, marginBottom: "4px" }}>{cur.mode === "deep" || cur.mode === "tracker" ? title : `${cur.shot ? "📷 " : ""}${title}`}</div>
         {busy && (
           <div style={{ display: "flex", alignItems: "center", gap: "8px", ...small, marginBottom: text ? "6px" : 0 }}>
             <Spinner style={{ width: "16px", height: "16px" }} />
@@ -385,6 +385,11 @@ export function Panel() {
       <PanelSection title={game.name || "Игра не запущена"}>
         {s?.auth_mode === "subscription" && <LimitsLine limits={limits} />}
         <CurrentAnswer tts={tts} canAsk={!busy && !!ready} onFollowup={(q) => ask(q, false)} />
+        {cur?.done && cur.mode === "tracker" && cur.appid > 0 && (
+          <PanelSectionRow>
+            <ButtonItem layout="below" onClick={() => openTracker(cur.appid, cur.game)}>📋 Открыть трекер</ButtonItem>
+          </PanelSectionRow>
+        )}
         {busy && (
           <PanelSectionRow>
             <ButtonItem layout="below" onClick={() => api.cancel()}>Остановить</ButtonItem>
@@ -445,6 +450,19 @@ export function Panel() {
               </DialogButton>
             </Focusable>
           </PanelSectionRow>
+          <PanelSectionRow>
+            {state?.game.tracker ? (
+              <ButtonItem layout="below" onClick={() => openTracker(game.appid, game.name)}
+                description="Свежий сейв: что рядом собрано, что упущено, что нельзя упустить. Мгновенно и без лимита.">
+                📋 Трекер
+              </ButtonItem>
+            ) : (
+              <ButtonItem layout="below" disabled={busy || !ready} onClick={() => startAsk("", false, "tracker", "panel")}
+                description="Claude один раз напишет для этой игры трекер по сейвам (5–15 минут). Потом он работает сам, мгновенно и без лимита.">
+                📋 Сделать трекер
+              </ButtonItem>
+            )}
+          </PanelSectionRow>
         </PanelSection>
       )}
 
@@ -461,7 +479,7 @@ export function Panel() {
             {state.game.history.slice().reverse().map((h) => (
               <PanelSectionRow key={h.ts + h.q}>
                 <div style={box}>
-                  <div style={{ ...small, marginBottom: "4px" }}>{h.mode === "deep" ? "🔬 " : h.mode === "progress" ? "🔎 " : h.shot ? "📷 " : ""}{h.q || "Глубокий разбор"}</div>
+                  <div style={{ ...small, marginBottom: "4px" }}>{h.mode === "deep" ? "🔬 " : h.mode === "progress" ? "🔎 " : h.mode === "tracker" ? "📋 " : h.shot ? "📷 " : ""}{h.q || "Глубокий разбор"}</div>
                   <Answer text={h.a} dim={!h.ok}
                     actions={(shown, full) => <AnswerActions title={h.q || "Глубокий разбор"} text={h.a} shown={shown} full={full} tts={tts} />} />
                 </div>

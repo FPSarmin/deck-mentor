@@ -100,12 +100,56 @@ def to_html(text: str) -> str:
     return out
 
 
+ICONS = {"done": "✅", "missing": "⭕", "missable": "⚠️", "lost": "❌", "unknown": "❔"}
+_ORDER = {"missable": 0, "missing": 1, "unknown": 2, "lost": 3, "done": 4}
+
+
+def tracker_html(data: dict | None, spoiler: str = "") -> str:
+    """The tracker result as safe HTML: the area the player is in first, what can still be lost on top."""
+    if not data or not data.get("groups"):
+        return ""
+    esc = html.escape
+    out = []
+    head = [f"<b>{esc(data['location'])}</b>"] if data.get("location") else []
+    if data.get("summary"):
+        head.append(esc(data["summary"]))
+    if head:
+        out.append('<div class="card">' + "<br>".join(head) + "</div>")
+    out.append('<p class="legend">✅ есть · ⭕ ещё нет · ⚠️ можно упустить · ❌ упущено · ❔ неясно</p>')
+    for g in data["groups"]:
+        items = sorted(g.get("items") or [], key=lambda it: _ORDER.get(it.get("status"), 2))
+        done = sum(1 for it in items if it.get("status") == "done")
+        rows = []
+        for it in items:
+            where = esc(it.get("where") or "")
+            if where and spoiler == "hint":
+                where = f"<details><summary>где</summary>{where}</details>"
+            elif where:
+                where = f'<div class="dim">{where}</div>'
+            note = f'<div class="note">{esc(it["note"])}</div>' if it.get("note") else ""
+            kind = f' <span class="dim">· {esc(it["kind"])}</span>' if it.get("kind") else ""
+            rows.append(f'<li class="st-{esc(it.get("status", "unknown"))}"><span class="ic">'
+                        f'{ICONS.get(it.get("status"), "❔")}</span><div>{esc(it["name"])}{kind}{note}{where}</div></li>')
+        title = f'{esc(g["title"])} <span class="dim">{done}/{len(items)}</span>'
+        body = f'<ul class="tr">{"".join(rows)}</ul>'
+        if g.get("current"):
+            out.append(f"<h3>{title}</h3>{body}")
+        else:
+            out.append(f'<details class="area"><summary>{title}</summary>{body}</details>')
+    if data.get("uncovered"):
+        out.append('<p class="dim">Трекер пока не знает: ' + esc(", ".join(data["uncovered"]))
+                   + ". Дополнить его можно кнопкой в панели на Деке.</p>")
+    return "\n".join(out)
+
+
 class PhoneServer:
     def __init__(self, logger, page: Callable[[], dict],
-                 ask: Callable[[str, bool], Awaitable[dict]] | None = None) -> None:
+                 ask: Callable[[str, bool], Awaitable[dict]] | None = None,
+                 refresh_tracker: Callable[[], Awaitable[dict]] | None = None) -> None:
         self.log = logger
         self.page = page
         self.ask = ask
+        self.refresh_tracker = refresh_tracker
         self.server: asyncio.base_events.Server | None = None
         self.url = ""
         self.token = ""
@@ -163,13 +207,16 @@ class PhoneServer:
             "game": page.get("game") or "Deck Mentor",
             "guide": to_html(page.get("guide") or ""),
             "current": cur and {
-                "question": cur.get("question") or ("Глубокий разбор" if cur.get("mode") == "deep" else ""),
+                "question": ("📋 Трекер" if cur.get("mode") == "tracker" else cur.get("question"))
+                or ("Глубокий разбор" if cur.get("mode") == "deep" else ""),
                 "html": to_html(split_followups(cur.get("answer") or cur.get("text") or "")[0]),
                 "done": bool(cur.get("done")),
                 "next": [str(q) for q in cur.get("followups") or []][:3],
                 "status": cur.get("status") or "",
             },
             "history": history,
+            "tracker_html": tracker_html(page.get("tracker"), page.get("spoiler", "")),
+            "tracker_updated": (page.get("tracker") or {}).get("updated", 0),
         }
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -187,6 +234,8 @@ class PhoneServer:
             base = f"/{self.token}" if self.token else "/\0"
             if method == "POST" and path == base + "/ask" and self.ask:
                 status, ctype, body = await self._ask(reader, headers)
+            elif method == "POST" and path == base + "/tracker" and self.refresh_tracker:
+                status, ctype, body = await self._tracker(reader, headers)
             elif method != "GET":
                 status, ctype, body = "405 Method Not Allowed", "text/plain", b"Not allowed"
             elif path in (base, base + "/"):
@@ -207,6 +256,20 @@ class PhoneServer:
             self.log.exception("phone page request failed")
         finally:
             writer.close()
+
+    async def _tracker(self, reader: asyncio.StreamReader, headers: dict) -> tuple[str, str, bytes]:
+        """POST /<token>/tracker: re-read a fresh save with the game's tracker script."""
+        if not headers.get("content-type", "").startswith("application/json"):
+            return "415 Unsupported Media Type", "application/json", b'{"ok": false, "error": "JSON only"}'
+        try:
+            length = int(headers.get("content-length", "0"))
+        except ValueError:
+            length = 0
+        if 0 < length <= MAX_BODY:
+            await asyncio.wait_for(reader.readexactly(length), timeout=10)
+        result = await self.refresh_tracker()
+        body = json.dumps({"ok": bool(result.get("ok")), "error": str(result.get("error") or "")}, ensure_ascii=False)
+        return "200 OK", "application/json; charset=utf-8", body.encode()
 
     async def _ask(self, reader: asyncio.StreamReader, headers: dict) -> tuple[str, str, bytes]:
         """POST /<token>/ask {"q": "...", "shot": true}. JSON only, so another site can't post a plain form here."""
@@ -253,25 +316,33 @@ summary{color:var(--accent);cursor:pointer}.empty{color:var(--dim)}
 textarea{width:100%;background:var(--bg);color:var(--text);border:1px solid #3a4350;border-radius:8px;padding:10px;font:inherit;resize:vertical}
 .ask{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:8px}
 .ask label{color:var(--dim);font-size:15px}.err{color:#ff8080;font-size:14px}
+.dim{color:var(--dim);font-size:14px}.note{color:#e8b14d;font-size:14px}.legend{color:var(--dim);font-size:13px}
+ul.tr{list-style:none;padding:0}ul.tr li{display:flex;gap:10px;padding:7px 0;border-bottom:1px solid #2a313c}
+ul.tr li.st-done{opacity:.6}.ic{flex:0 0 auto}details.area{margin:10px 0}details.area summary{font-weight:600;color:var(--text)}
 button.send{background:var(--accent);color:#06121f;border:0;border-radius:8px;font:inherit;font-weight:600;padding:9px 18px}
 button.send:disabled,button.chip:disabled{opacity:.5}
 .chips{display:flex;flex-direction:column;gap:6px;margin-top:10px}
 button.chip{text-align:left;background:none;color:var(--accent);border:1px solid #3a4350;border-radius:8px;font:inherit;padding:8px 10px}
 </style></head><body>
 <header><h1 id="game">Deck Mentor</h1>
-<nav><button data-tab="now" class="on">Сейчас</button><button data-tab="guide">Гайд</button><button data-tab="history">История</button></nav></header>
+<nav><button data-tab="now" class="on">Сейчас</button><button data-tab="tracker">Трекер</button><button data-tab="guide">Гайд</button><button data-tab="history">История</button></nav></header>
 <main><section id="now"><form id="askf" class="card">
 <textarea id="q" rows="3" maxlength="1000" placeholder="Спросите об игре: ответ появится здесь и на Деке"></textarea>
 <div class="ask"><label><input type="checkbox" id="shot" checked> 📷 Со скриншотом Деки</label>
 <button class="send" id="send">Спросить</button></div><div class="err" id="askerr"></div></form>
-<div id="nowbody"></div></section><section id="guide" hidden></section><section id="history" hidden></section></main>
+<div id="nowbody"></div></section><section id="tracker" hidden><div class="ask"><span class="dim" id="trackwhen"></span>
+<button class="send" id="trackbtn">🔄 Обновить по сейву</button></div><div class="err" id="trackerr"></div>
+<div id="trackbody"></div></section><section id="guide" hidden></section><section id="history" hidden></section></main>
 <script>
 const shown = {};
 const base = location.pathname.replace(/\\/$/, "");
 let timer = null, busyNow = false, sending = false;
 function put(id, html) { if (shown[id] !== html) { document.getElementById(id).innerHTML = html; shown[id] = html; } }
 function esc(s) { return String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
-function when(ts) { const d = new Date(ts * 1000); return d.toLocaleDateString() + " " + d.toLocaleTimeString().slice(0, 5); }
+function when(ts) {
+  const d = new Date(ts * 1000), p = (n) => String(n).padStart(2, "0");
+  return p(d.getDate()) + "." + p(d.getMonth() + 1) + " " + p(d.getHours()) + ":" + p(d.getMinutes());
+}
 document.querySelectorAll("nav button").forEach(b => b.onclick = () => {
   document.querySelectorAll("nav button").forEach(x => x.classList.toggle("on", x === b));
   document.querySelectorAll("main section").forEach(s => s.hidden = s.id !== b.dataset.tab);
@@ -293,6 +364,8 @@ async function tick() {
         : last ? '<div class="card"><div class="q">' + esc(last.q) + "</div>" + last.html + "</div>"
         : '<p class="empty">Задайте вопрос в Deck Mentor на Деке, и ответ появится здесь.</p>';
       put("nowbody", now);
+      put("trackbody", d.tracker_html || '<p class="empty">Трекера пока нет. Создайте его кнопкой «📋 Трекер» в панели на Деке.</p>');
+      document.getElementById("trackwhen").textContent = d.tracker_updated ? "Обновлено " + when(d.tracker_updated) : "";
       put("guide", d.guide || '<p class="empty">Гайда пока нет. Запустите глубокий разбор в панели.</p>');
       put("history", d.history.map(h => '<div class="card"><div class="q">' + when(h.ts) + " · " + esc(h.q || "Глубокий разбор")
         + "</div>" + h.html + "</div>").join("") || '<p class="empty">Пока пусто.</p>');
@@ -328,6 +401,17 @@ document.getElementById("askf").onsubmit = async (e) => {
   e.preventDefault();
   const box = document.getElementById("q");
   if (await send(box.value.trim(), document.getElementById("shot").checked)) { box.value = ""; box.blur(); }
+};
+document.getElementById("trackbtn").onclick = async () => {
+  const btn = document.getElementById("trackbtn"), err = document.getElementById("trackerr");
+  btn.disabled = true; err.textContent = ""; btn.textContent = "Читаю сейв…";
+  try {
+    const r = await fetch(base + "/tracker", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    const d = await r.json();
+    if (!d.ok) err.textContent = d.error || "Не получилось";
+  } catch (x) { err.textContent = "Нет связи с Декой"; }
+  btn.disabled = false; btn.textContent = "🔄 Обновить по сейву";
+  tick();
 };
 document.getElementById("nowbody").onclick = (e) => {
   const chip = e.target.closest("button.chip");

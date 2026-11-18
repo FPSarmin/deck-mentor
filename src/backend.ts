@@ -3,7 +3,7 @@ import { addEventListener, callable } from "@decky/api";
 export const EVENT = "deck_mentor_event";
 export const HOTKEY_EVENT = "deck_mentor_hotkey";
 
-export type Mode = "quick" | "deep" | "recap" | "achievements" | "progress";
+export type Mode = "quick" | "deep" | "recap" | "achievements" | "progress" | "tracker";
 export type Origin = "panel" | "hotkey" | "voice" | "phone";
 export const SPOILER_MARK = "<<<SPOILER>>>";
 
@@ -125,7 +125,27 @@ export interface State {
     history_total: number;
     guide: string;
     turns: number;
+    /** The game has a tracker script (Claude wrote it once). */
+    tracker: boolean;
   };
+}
+
+export type TrackerStatus = "done" | "missing" | "missable" | "lost" | "unknown";
+
+export interface TrackerItem {
+  name: string;
+  kind: string;
+  status: TrackerStatus;
+  where: string;
+  note: string;
+}
+
+export interface TrackerData {
+  location: string;
+  summary: string;
+  groups: { title: string; current: boolean; items: TrackerItem[] }[];
+  uncovered: string[];
+  updated: number;
 }
 
 export interface PhoneStatus {
@@ -169,6 +189,9 @@ export const setSettings = callable<[patch: Partial<Settings>], Settings>("set_s
 export const setGame = callable<[appid: number, patch: { spoiler?: string; wiki?: string }], { spoiler: string; wiki: string }>("set_game");
 export const phoneStart = callable<[appid: number, game: string], PhoneStatus & { ok: boolean; error?: string }>("phone_start");
 export const phoneStop = callable<[], boolean>("phone_stop");
+export const trackerGet = callable<[appid: number], { data: TrackerData | null; has_script: boolean; spoiler: string }>("tracker_get");
+export const trackerRefresh = callable<[appid: number, game: string],
+  { ok: boolean; data?: TrackerData | null; error?: string; need_build?: boolean }>("tracker_refresh");
 export const setNotes = callable<[appid: number, notes: string], boolean>("set_notes");
 export const deleteGuide = callable<[appid: number], boolean>("delete_guide");
 export const newChat = callable<[appid: number], boolean>("new_chat");

@@ -18,7 +18,7 @@ _PY_MODULES = os.path.join(decky.DECKY_PLUGIN_DIR, "py_modules")
 if _PY_MODULES not in sys.path:
     sys.path.insert(0, _PY_MODULES)
 
-from deck_mentor import capture, claude_cli, cleanup, downloads, games, phone, prompts  # noqa: E402
+from deck_mentor import capture, claude_cli, cleanup, downloads, games, phone, prompts, tracker  # noqa: E402
 from deck_mentor.hotkey import COMBOS, Binding, HotkeyListener  # noqa: E402
 from deck_mentor.store import GameState, Settings  # noqa: E402
 from deck_mentor.util import clean_env, dir_size, which  # noqa: E402
@@ -60,9 +60,10 @@ class Plugin:
         self.last_cleanup = 0.0
         self.hotkey = HotkeyListener(decky.logger)
         self.voice_lock = asyncio.Lock()
+        self.tracker_lock = asyncio.Lock()
         self.voice_error = ""
         self.phone_appid = 0
-        self.phone = phone.PhoneServer(decky.logger, lambda: self._phone_page(), self._phone_ask)
+        self.phone = phone.PhoneServer(decky.logger, lambda: self._phone_page(), self._phone_ask, self._phone_tracker)
         self.voice = Voice(decky.DECKY_PLUGIN_DIR, decky.DECKY_PLUGIN_RUNTIME_DIR, decky.logger)
         self.limits_path = os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, "limits.json")
         try:
@@ -263,6 +264,7 @@ class Plugin:
                 "history_total": len(state.data.get("history", [])),
                 "guide": guide,
                 "turns": state.data.get("turns", 0),
+                "tracker": tracker.has_script(state.dir),
             },
         }
 
@@ -342,8 +344,44 @@ class Plugin:
             "game": state.data.get("name") or "Deck Mentor",
             "guide": state.guide(),
             "history": state.data.get("history", [])[-40:],
+            "tracker": tracker.load(state.dir),
+            "spoiler": state.data.get("spoiler") or self.settings["spoiler"],
             "current": cur and {k: cur.get(k) for k in ("question", "text", "answer", "done", "status", "mode", "followups")},
         }
+
+    # ------------------------------------------------------------ tracker
+    async def tracker_get(self, appid):
+        self._ensure()
+        state = self._game(appid)
+        return {"data": tracker.load(state.dir), "has_script": tracker.has_script(state.dir),
+                "spoiler": state.data.get("spoiler") or self.settings["spoiler"]}
+
+    async def tracker_refresh(self, appid, game_name=""):
+        """Fresh copy of the saves, the game's own tracker script, stored result. No Claude request."""
+        self._ensure()
+        state = self._game(appid)
+        if not tracker.has_script(state.dir):
+            return {"ok": False, "need_build": True, "error": "Для этой игры ещё нет трекера."}
+        async with self.tracker_lock:
+            saves = os.path.join(state.dir, "track-saves")
+            try:
+                cleanup.remove_path(saves)
+                await asyncio.to_thread(games.copy_saves, int(appid), saves, 300_000_000, 64_000_000,
+                                        game_name or state.data.get("name", ""))
+                data = await tracker.run(state.dir, saves)
+                tracker.save(state.dir, data)
+                return {"ok": True, "data": data}
+            except tracker.TrackerError as exc:
+                return {"ok": False, "error": str(exc), "data": tracker.load(state.dir)}
+            except Exception as exc:
+                decky.logger.exception("tracker failed")
+                return {"ok": False, "error": f"Ошибка: {exc}", "data": tracker.load(state.dir)}
+            finally:
+                cleanup.remove_path(saves)
+
+    async def _phone_tracker(self) -> dict:
+        res = await self.tracker_refresh(self.phone_appid)
+        return {"ok": res.get("ok", False), "error": res.get("error", "")}
 
     async def set_notes(self, appid, notes):
         self._ensure()
@@ -395,11 +433,11 @@ class Plugin:
         return True
 
     async def ask(self, appid, game_name, question, with_shot=False, mode="quick", origin="panel", facts=None):
-        """Start a request. mode: quick | deep | recap | achievements | progress. origin: panel | hotkey | voice | phone."""
+        """Start a request. mode: quick | deep | recap | achievements | progress | tracker. origin: panel | hotkey | voice | phone."""
         self._ensure()
         if self.task and not self.task.done():
             return {"ok": False, "error": "Я ещё отвечаю на прошлый вопрос."}
-        mode = mode if mode in ("quick", "deep", "recap", "achievements", "progress") else "quick"
+        mode = mode if mode in ("quick", "deep", "recap", "achievements", "progress", "tracker") else "quick"
         request_id = uuid.uuid4().hex[:12]
         self.current = {
             "id": request_id, "appid": int(appid or 0), "game": game_name or "", "question": question or "",
@@ -523,7 +561,7 @@ class Plugin:
 
     async def _run(self, rid, appid, game_name, question, with_shot, mode, origin, facts=None):
         state = self._game(appid)
-        deep = mode in ("deep", "progress")  # both copy the saves and let Claude parse them
+        deep = mode in ("deep", "progress", "tracker")  # these copy the saves and let Claude parse them
         try:
             claude = claude_cli.find_claude(self.settings["claude_path"])
             if not claude:
@@ -555,7 +593,8 @@ class Plugin:
                 digest = prompts.history_block(history, 5)
             context = prompts.context_block(game_name, appid or None, spoiler, state.data.get("notes", ""),
                                             "" if deep else state.guide(), quick=quick_origin,
-                                            facts=facts, history=digest, wiki=wiki)
+                                            facts=facts, history=digest, wiki=wiki,
+                                            tracked="" if deep else prompts.tracker_block(tracker.load(state.dir)))
 
             web = ["WebSearch", "WebFetch"] if self.settings["web_search"] else []
             tools, allowed = list(web), list(web)
@@ -577,10 +616,14 @@ class Plugin:
                            "Bash(python3 *)", "Bash(rm -rf ./scratch)"] + web
                 if mode == "progress":
                     text = prompts.progress_task(game_name, install, spoiler, bool(copied["sources"]), wiki)
+                elif mode == "tracker":
+                    text = prompts.tracker_task(game_name, install, bool(copied["sources"]), wiki, question)
                 else:
                     text = prompts.deep_task(game_name, install, spoiler, bool(copied["sources"]), question, wiki)
                 effort = "medium" if self.settings["effort"] == "low" else self.settings["effort"]
                 max_turns = int(self.settings["deep_max_turns"])
+                if mode == "tracker":
+                    max_turns = max(max_turns, 60)  # writing and testing a parser takes more steps
                 timeout = DEEP_TIMEOUT
             else:
                 text = question or "Что мне сейчас делать?"
@@ -635,11 +678,20 @@ class Plugin:
                 if answer:
                     error = "Не хватило шагов, ответ может быть неполным."
             answer, followups = prompts.split_followups(answer)
+            if mode == "tracker" and answer:
+                # Run the fresh script right away on the same save copy, so the page is ready.
+                try:
+                    data = await tracker.run(state.dir, os.path.join(state.dir, "saves"))
+                    tracker.save(state.dir, data)
+                except tracker.TrackerError as exc:
+                    error = f"{error} {exc}".strip()
             state.data["turns"] = state.data.get("turns", 0) + 1
             if png_b64:
                 state.data["shots"] = state.data.get("shots", 0) + 1
             if mode == "progress":
                 label = "Проверка прогресса"
+            elif mode == "tracker":
+                label = "Трекер" + (": исправление" if question else "")
             else:
                 label = question if not deep else ("Глубокий разбор" + (f": {question}" if question else ""))
             state.record(label, answer or error, bool(png_b64), mode, ok)

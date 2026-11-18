@@ -13,7 +13,7 @@ import zlib
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "py_modules"))
 
-from deck_mentor import capture, cleanup, games, hotkey, phone, prompts, running  # noqa: E402
+from deck_mentor import capture, cleanup, games, hotkey, phone, prompts, running, tracker  # noqa: E402
 from deck_mentor.voice import Voice  # noqa: E402
 
 
@@ -455,7 +455,13 @@ def test_phone_server():
         asked.append((q, shot))
         return {"ok": len(asked) == 1, "error": "" if len(asked) == 1 else "Я ещё отвечаю на прошлый вопрос."}
 
-    server = phone.PhoneServer(logging.getLogger("test"), lambda: page, ask)
+    refreshed = []
+
+    async def refresh_tracker():
+        refreshed.append(1)
+        return {"ok": False, "error": "Для этой игры ещё нет трекера."}
+
+    server = phone.PhoneServer(logging.getLogger("test"), lambda: page, ask, refresh_tracker)
     original = phone.local_ip
     phone.local_ip = lambda: "127.0.0.1"
 
@@ -485,6 +491,9 @@ def test_phone_server():
         assert (await post(f"/{token}/ask", b'{"q": "  "}'))[0] == 400
         assert (await post(f"/{token}/ask", b"x" * 9000))[0] == 413
         assert (await post("/wrong/ask", q))[0] == 405 and len(asked) == 2
+        code, body = await post(f"/{token}/tracker", b"{}")
+        assert code == 200 and json.loads(body) == {"ok": False, "error": "Для этой игры ещё нет трекера."}
+        assert (await post(f"/{token}/tracker", b"x", "text/plain"))[0] == 415 and refreshed == [1]
         again = await server.start()  # extends the timer, keeps the address
         assert again["url"] == status["url"]
         await server.stop()
@@ -518,6 +527,98 @@ def test_followups_and_progress_task():
     })
     data = server.data()
     assert "NEXT" not in data["current"]["html"] and data["current"]["next"] == ["Где", "Ещё"]
+
+
+SAMPLE_TRACKER = r"""
+import glob, json, os, sys
+saves = sys.argv[1]
+files = sorted(glob.glob(os.path.join(saves, "**", "*.sav"), recursive=True), key=os.path.getmtime)
+got = set(open(files[-1]).read().split()) if files else set()
+checklist = {"Plateau": [("Oman Au", "святилище", "в лесу", ""), ("Paraglider", "предмет", "у старика", "до спуска с плато")],
+             "Kakariko": [("Bolson", "NPC", "в деревне", "")]}
+groups = []
+for area, items in checklist.items():
+    rows = []
+    for name, kind, where, missable in items:
+        status = "done" if name.replace(" ", "_") in got else ("missable" if missable else "missing")
+        rows.append({"name": name, "kind": kind, "status": status, "where": where, "note": missable})
+    groups.append({"title": area, "current": area == "Plateau", "items": rows})
+print("debug line")
+print(json.dumps({"location": "Plateau", "summary": "1 of 2", "groups": groups, "uncovered": ["Hyrule Field"]}))
+"""
+
+
+def test_tracker_script_runs_on_save_copy():
+    with tempfile.TemporaryDirectory() as tmp:
+        work, saves = os.path.join(tmp, "game"), os.path.join(tmp, "saves", "port_0", "slot1")
+        os.makedirs(saves)
+        with open(os.path.join(saves, "game.sav"), "w") as fh:
+            fh.write("Oman_Au other_flag")
+
+        async def run():
+            return await tracker.run(work, os.path.join(tmp, "saves"))
+
+        try:
+            asyncio.run(run())
+            raise AssertionError("no script yet")
+        except tracker.TrackerError as exc:
+            assert "ещё нет" in str(exc)
+        os.makedirs(os.path.join(work, "tools"))
+        with open(tracker.script_path(work), "w") as fh:
+            fh.write(SAMPLE_TRACKER)
+        assert tracker.has_script(work)
+        data = asyncio.run(run())
+        assert data["location"] == "Plateau" and data["uncovered"] == ["Hyrule Field"] and data["updated"] > 0
+        plateau = data["groups"][0]
+        assert plateau["current"] and [i["status"] for i in plateau["items"]] == ["done", "missable"]
+        assert tracker.counts(data)["missing"] == 1
+        tracker.save(work, data)
+        assert tracker.load(work)["groups"][1]["title"] == "Kakariko"
+
+        with open(tracker.script_path(work), "w") as fh:
+            fh.write("raise SystemExit('broken parser')")
+        try:
+            asyncio.run(run())
+            raise AssertionError("should fail")
+        except tracker.TrackerError as exc:
+            assert "broken parser" in str(exc)
+        with open(tracker.script_path(work), "w") as fh:
+            fh.write("print('not json')")
+        try:
+            asyncio.run(run())
+            raise AssertionError("should fail")
+        except tracker.TrackerError as exc:
+            assert "не JSON" in str(exc)
+
+    clean = tracker.sanitize({"groups": [{"title": "A", "items": [
+        {"name": "x" * 500, "status": "weird"}, {"name": ""}, "junk", {"name": "ok", "status": "LOST", "where": 5}]},
+        {"title": "B", "current": True, "items": []}], "uncovered": ["", "C"]})
+    assert clean["groups"][0]["title"] == "B" and len(clean["groups"][1]["items"]) == 2
+    assert clean["groups"][1]["items"][0]["status"] == "unknown" and len(clean["groups"][1]["items"][0]["name"]) == 120
+    assert clean["groups"][1]["items"][1] == {"name": "ok", "kind": "", "status": "lost", "where": "5", "note": ""}
+    assert clean["uncovered"] == ["C"]
+    block = prompts.tracker_block(data)
+    assert "location: Plateau" in block and "- [missable] Paraglider (до спуска с плато)" in block
+    assert "Oman Au" not in block and "Bolson" not in block  # done items and far areas stay out
+    ctx = prompts.context_block("G", 0, "", "", "", False, tracked=block)
+    assert "<tracker_from_save>" in ctx
+    task = prompts.tracker_task("Savage Wind", None, True, "", "uncovered: X")
+    assert "./tools/tracker.py" in task and '"status"' in task and "uncovered: X" in task
+
+
+def test_tracker_on_phone():
+    data = tracker.sanitize({"location": "Plateau <b>", "groups": [
+        {"title": "Plateau", "current": True, "items": [
+            {"name": "Paraglider", "status": "done", "where": "old man"},
+            {"name": "Oman Au <script>", "status": "missable", "where": "west", "note": "before leaving"}]},
+        {"title": "Kakariko", "items": [{"name": "Bolson", "status": "missing", "where": "village"}]}]})
+    page = phone.tracker_html(data, "hint")
+    assert "&lt;script&gt;" in page and "<script>" not in page and "Plateau &lt;b&gt;" in page
+    assert page.index("Oman Au") < page.index("Paraglider")  # what can be lost goes first
+    assert "<details><summary>где</summary>west</details>" in page
+    assert '<details class="area"><summary>Kakariko' in page and "1/2" in page
+    assert '<div class="dim">west</div>' in phone.tracker_html(data, "full")
+    assert phone.tracker_html(None) == ""
 
 
 if __name__ == "__main__":

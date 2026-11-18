@@ -216,7 +216,7 @@ export function handleEvent(ev: BackendEvent) {
         reopenAfterCapture = false; // failed before the screenshot: bring the menu back anyway
         Navigation.OpenQuickAccessMenu(DECKY_TAB);
       }
-      if (ev.origin !== "panel" || !panelOpen) showAnswerToast(ev.answer, ev.error, ev.game, ev.mode);
+      if (ev.origin !== "panel" || !panelOpen) showAnswerToast(ev.answer, ev.error, ev.game, ev.mode, next.appid);
       break;
   }
   current = next;
@@ -224,9 +224,13 @@ export function handleEvent(ev: BackendEvent) {
   else notify();
 }
 
-function showAnswerToast(answer: string, error: string, game: string, mode?: api.Mode) {
+function showAnswerToast(answer: string, error: string, game: string, mode?: api.Mode, appid = 0) {
   const title = mode === "deep" ? "Гайд готов" : mode === "progress" ? "Прогресс проверен"
-    : game ? `Подсказка: ${game}` : "Подсказка";
+    : mode === "tracker" ? "Трекер готов" : game ? `Подсказка: ${game}` : "Подсказка";
+  if (mode === "tracker" && appid) {
+    toaster.toast({ title, body: answer ? shorten(answer) : error, duration: 15000, onClick: () => openTracker(appid, game, false) });
+    return;
+  }
   toaster.toast({
     title,
     body: answer ? shorten(answer) : error || "Нет ответа",
@@ -266,6 +270,29 @@ export let readerContent: { title: string; text: string } = { title: "", text: "
 export const READER_ROUTE = "/deck-mentor-reader";
 
 let readerFromPanel = false;
+
+export const TRACKER_ROUTE = "/deck-mentor-tracker";
+
+/** What the tracker page shows; it refreshes from a fresh save as soon as it opens. */
+export let trackerContent: {
+  appid: number; game: string; data: api.TrackerData | null; spoiler: string;
+} = { appid: 0, game: "", data: null, spoiler: "" };
+
+export async function openTracker(appid: number, game: string, fromPanel = true) {
+  let data: api.TrackerData | null = null;
+  let spoiler = settings?.spoiler || "";
+  try {
+    const t = await api.trackerGet(appid);
+    data = t.data;
+    spoiler = t.spoiler;
+  } catch {
+    // the page refreshes on its own
+  }
+  trackerContent = { appid, game, data, spoiler };
+  readerFromPanel = fromPanel;
+  Navigation.CloseSideMenus();
+  Navigation.Navigate(TRACKER_ROUTE);
+}
 
 export function openReader(title: string, text: string, fromPanel = true) {
   readerContent = { title, text };

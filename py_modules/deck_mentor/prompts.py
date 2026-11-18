@@ -40,6 +40,8 @@ what they were doing last time, what they planned next, and the one next step, i
 full list on the web if you need it. Point out which ones fit the player's current progress and which \
 are missable (can be lost forever after some point), and say before which moment. Do not reveal what \
 hidden achievements are about unless spoiler_level is "full".
+- <tracker_from_save> (when present) is what the game's tracker script last read from the save: what is \
+still missing around the player. Use it for "what's nearby / what did I miss" questions.
 - <player_notes> and <game_guide> hold what is already known about this playthrough. Treat them as \
 background, and when the screenshot or question contradicts them, trust the screenshot and question.
 - End every reply with one last line that starts with <<<NEXT>>> and lists 2-3 short follow-up questions \
@@ -129,8 +131,29 @@ def history_block(history: list[dict], limit: int, now: float | None = None) -> 
     return "\n".join(lines)
 
 
+def tracker_block(data: dict | None, limit: int = 40) -> str:
+    """What the tracker script last read from the save, for the areas around the player: only what's left."""
+    if not data or not data.get("groups"):
+        return ""
+    lines = ["<tracker_from_save>"]
+    if data.get("location"):
+        lines.append(f"location: {data['location']}")
+    for g in data["groups"]:
+        if not g.get("current"):
+            continue
+        left = [it for it in g.get("items", []) if it.get("status") in ("missing", "missable", "lost")]
+        lines.append(f"{g['title']}: {len(g.get('items', [])) - len(left)} of {len(g.get('items', []))} done")
+        for it in sorted(left, key=lambda it: it["status"] != "missable"):
+            if len(lines) >= limit:
+                break
+            note = f" ({it['note']})" if it.get("note") else ""
+            lines.append(f"- [{it['status']}] {it['name']}{note}")
+    lines.append("</tracker_from_save>")
+    return "\n".join(lines) if len(lines) > 2 else ""
+
+
 def context_block(game_name: str, appid: int | None, spoiler: str, notes: str, guide: str, quick: bool,
-                  facts: dict | None = None, history: str = "", wiki: str = "") -> str:
+                  facts: dict | None = None, history: str = "", wiki: str = "", tracked: str = "") -> str:
     parts = [
         "<context>",
         f"game: {game_name or 'unknown'}" + (f" (Steam appid {appid})" if appid else ""),
@@ -147,6 +170,8 @@ def context_block(game_name: str, appid: int | None, spoiler: str, notes: str, g
         parts.append(fb)
     if history:
         parts.append(history)
+    if tracked:
+        parts.append(tracked)
     if notes.strip():
         parts += ["<player_notes>", notes.strip()[:2000], "</player_notes>"]
     if guide.strip():
@@ -240,4 +265,52 @@ def progress_task(game_name: str, install_dir: str | None, spoiler: str, has_sav
     ]
     if wiki.strip():
         lines += ["", f"The player prefers this source; check it first: {wiki.strip()[:200]}"]
+    return "\n".join(lines)
+
+
+TRACKER_FORMAT = """{"location": "<where the player is now>", "summary": "<one short line, e.g. 12 of 20 found nearby>",
+ "groups": [{"title": "<area>", "current": true, "items": [
+   {"name": "<as the game shows it>", "kind": "<collectible, upgrade, quest, boss, shop...>",
+    "status": "done | missing | missable | lost | unknown", "where": "<how to find it, short>",
+    "note": "<optional, e.g. missable: lost after the castle>"}]}],
+ "uncovered": ["<areas the player has reached that the checklist does not cover yet>"]}"""
+
+
+def tracker_task(game_name: str, install_dir: str | None, has_saves: bool, wiki: str = "", problem: str = "") -> str:
+    """Write or extend ./tools/tracker.py, which the plugin then runs by itself on every fresh save."""
+    lines = [f"Build or update the progress tracker for {game_name or 'this game'}.", "",
+             *_workdir(has_saves, install_dir), ""]
+    lines += [
+        "Goal: write ./tools/tracker.py, a Python 3 script (standard library only; helper modules and data files "
+        "next to it in ./tools/ are fine). The plugin runs it by itself, without you, every time the player presses "
+        "\"Трекер\": `python3 ./tools/tracker.py <folder with a fresh copy of the saves>`. It must read the saves and "
+        "print one JSON object to stdout: what the player has collected or done and what not, area by area.",
+        "- Find the save files by searching the folder given as the first argument recursively (by name or "
+        "content), never by a fixed path: the folder layout under it can change between runs. If there are several "
+        "slots, use the most recently modified save.",
+        "- Build the checklist per area from the wiki and guides: collectibles, upgrades, side quests, NPCs and "
+        "shops, optional bosses, and especially missable things. Keep it in the script or in a data file in ./tools/. "
+        "Cover at least the areas the player has reached and the next one; it can grow later.",
+        "- Match checklist entries to the save by the game's internal IDs or flags where you can (look in the save "
+        "and the game files). Use status \"unknown\" when the save doesn't say.",
+        "- Statuses: done = collected or completed; missing = not yet, still obtainable; missable = not yet and "
+        "will be lost after some story point (say which in note); lost = missed for good; unknown.",
+        "- Set \"current\": true for the area the player is in and the areas right next to it. List areas the player "
+        "has reached that your checklist doesn't cover in \"uncovered\".",
+        "- Names as the game shows them, with a translation in parentheses once when the game's language differs; "
+        "all other text in the player's language (Russian by default).",
+        "- It must finish within 20 seconds, never write files and never use the network.",
+        "Output format:",
+        TRACKER_FORMAT,
+        "",
+        "Run `python3 ./tools/tracker.py ./saves`, check that it prints valid JSON in this format and that the "
+        "result matches what you see in the save, and fix it until it does.",
+        "",
+        _RULES,
+        "Reply with 2-4 short lines: what the tracker covers now and what it doesn't yet.",
+    ]
+    if wiki.strip():
+        lines += ["", f"The player prefers this source; check it first: {wiki.strip()[:200]}"]
+    if problem.strip():
+        lines += ["", f"Last run of the tracker: {problem.strip()[:1500]}"]
     return "\n".join(lines)
