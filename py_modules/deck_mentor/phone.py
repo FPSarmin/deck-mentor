@@ -1,8 +1,9 @@
-"""Read the guide and answers on a phone: a tiny read-only web page on the local network.
+"""Read the guide and answers on a phone, and type questions there: a tiny web page on the local network.
 
 Off until the player turns it on in the panel. The address carries a random token,
-the page only shows this plugin's guide and answers for the current game, nothing
-can be changed through it, and the server stops by itself after a few hours.
+the page only shows this plugin's guide and answers for the current game, the only
+thing it can do is ask a question (like the panel's own field), and the server stops
+by itself after a few hours.
 """
 
 from __future__ import annotations
@@ -14,12 +15,14 @@ import re
 import secrets
 import socket
 import time
-from typing import Callable
+from typing import Awaitable, Callable
 
 from .prompts import SPOILER_MARK
 
 PORTS = (8765, 8766, 8767, 18765, 28765)
 LIFETIME = 3 * 3600
+MAX_BODY = 8192
+MAX_QUESTION = 1000
 
 
 class PhoneError(RuntimeError):
@@ -98,9 +101,11 @@ def to_html(text: str) -> str:
 
 
 class PhoneServer:
-    def __init__(self, logger, page: Callable[[], dict]) -> None:
+    def __init__(self, logger, page: Callable[[], dict],
+                 ask: Callable[[str, bool], Awaitable[dict]] | None = None) -> None:
         self.log = logger
         self.page = page
+        self.ask = ask
         self.server: asyncio.base_events.Server | None = None
         self.url = ""
         self.token = ""
@@ -169,15 +174,20 @@ class PhoneServer:
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
             request = await asyncio.wait_for(reader.readline(), timeout=10)
-            for _ in range(100):  # skip headers
+            headers = {}
+            for _ in range(100):
                 line = await asyncio.wait_for(reader.readline(), timeout=10)
                 if line in (b"\r\n", b"\n", b""):
                     break
+                key, _, value = line.decode("latin-1").partition(":")
+                headers[key.strip().lower()] = value.strip()
             parts = request.decode("latin-1").split()
             method, path = (parts[0], parts[1].split("?")[0]) if len(parts) >= 2 else ("", "")
             base = f"/{self.token}" if self.token else "/\0"
-            if method != "GET":
-                status, ctype, body = "405 Method Not Allowed", "text/plain", b"GET only"
+            if method == "POST" and path == base + "/ask" and self.ask:
+                status, ctype, body = await self._ask(reader, headers)
+            elif method != "GET":
+                status, ctype, body = "405 Method Not Allowed", "text/plain", b"Not allowed"
             elif path in (base, base + "/"):
                 status, ctype, body = "200 OK", "text/html; charset=utf-8", PAGE.encode()
             elif path == base + "/data":
@@ -196,6 +206,29 @@ class PhoneServer:
             self.log.exception("phone page request failed")
         finally:
             writer.close()
+
+    async def _ask(self, reader: asyncio.StreamReader, headers: dict) -> tuple[str, str, bytes]:
+        """POST /<token>/ask {"q": "...", "shot": true}. JSON only, so another site can't post a plain form here."""
+        def reply(code: str, ok: bool, error: str = "") -> tuple[str, str, bytes]:
+            return code, "application/json; charset=utf-8", json.dumps({"ok": ok, "error": error}, ensure_ascii=False).encode()
+
+        if not headers.get("content-type", "").startswith("application/json"):
+            return reply("415 Unsupported Media Type", False, "JSON only")
+        try:
+            length = int(headers.get("content-length", "0"))
+        except ValueError:
+            length = -1
+        if not 0 < length <= MAX_BODY:
+            return reply("413 Payload Too Large", False, "Слишком длинный вопрос.")
+        try:
+            data = json.loads(await asyncio.wait_for(reader.readexactly(length), timeout=10))
+        except (ValueError, asyncio.IncompleteReadError):
+            return reply("400 Bad Request", False, "Не понял запрос.")
+        question = str(data.get("q", "") if isinstance(data, dict) else "").strip()[:MAX_QUESTION]
+        if not question:
+            return reply("400 Bad Request", False, "Напишите вопрос.")
+        result = await self.ask(question, bool(data.get("shot")))
+        return reply("200 OK", bool(result.get("ok")), str(result.get("error") or ""))
 
 
 PAGE = """<!doctype html>
@@ -216,12 +249,23 @@ main{padding:12px 16px 48px;max-width:760px;margin:0 auto}
 h3{font-size:18px;margin:18px 0 6px}p{margin:6px 0}ul,ol{margin:6px 0;padding-left:22px}
 a{color:var(--accent)}details.spoiler{margin-top:10px;border-top:1px dashed #3a4350;padding-top:8px}
 summary{color:var(--accent);cursor:pointer}.empty{color:var(--dim)}
+textarea{width:100%;background:var(--bg);color:var(--text);border:1px solid #3a4350;border-radius:8px;padding:10px;font:inherit;resize:vertical}
+.ask{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:8px}
+.ask label{color:var(--dim);font-size:15px}.err{color:#ff8080;font-size:14px}
+button.send{background:var(--accent);color:#06121f;border:0;border-radius:8px;font:inherit;font-weight:600;padding:9px 18px}
+button.send:disabled{opacity:.5}
 </style></head><body>
 <header><h1 id="game">Deck Mentor</h1>
 <nav><button data-tab="now" class="on">Сейчас</button><button data-tab="guide">Гайд</button><button data-tab="history">История</button></nav></header>
-<main><section id="now"></section><section id="guide" hidden></section><section id="history" hidden></section></main>
+<main><section id="now"><form id="askf" class="card">
+<textarea id="q" rows="3" maxlength="1000" placeholder="Спросите об игре: ответ появится здесь и на Деке"></textarea>
+<div class="ask"><label><input type="checkbox" id="shot" checked> 📷 Со скриншотом Деки</label>
+<button class="send" id="send">Спросить</button></div><div class="err" id="askerr"></div></form>
+<div id="nowbody"></div></section><section id="guide" hidden></section><section id="history" hidden></section></main>
 <script>
 const shown = {};
+const base = location.pathname.replace(/\\/$/, "");
+let timer = null, busyNow = false, sending = false;
 function put(id, html) { if (shown[id] !== html) { document.getElementById(id).innerHTML = html; shown[id] = html; } }
 function esc(s) { return String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
 function when(ts) { const d = new Date(ts * 1000); return d.toLocaleDateString() + " " + d.toLocaleTimeString().slice(0, 5); }
@@ -231,8 +275,9 @@ document.querySelectorAll("nav button").forEach(b => b.onclick = () => {
 });
 async function tick() {
   let busy = false;
+  clearTimeout(timer);
   try {
-    const r = await fetch(location.pathname.replace(/\\/$/, "") + "/data", { cache: "no-store" });
+    const r = await fetch(base + "/data", { cache: "no-store" });
     if (r.ok) {
       const d = await r.json();
       document.getElementById("game").textContent = d.game;
@@ -242,17 +287,37 @@ async function tick() {
         + (busy ? '<div class="status">⏳ ' + esc(c.status || "Думаю…") + "</div>" : "") + "</div>"
         : last ? '<div class="card"><div class="q">' + esc(last.q) + "</div>" + last.html + "</div>"
         : '<p class="empty">Задайте вопрос в Deck Mentor на Деке, и ответ появится здесь.</p>';
-      put("now", now);
+      put("nowbody", now);
       put("guide", d.guide || '<p class="empty">Гайда пока нет. Запустите глубокий разбор в панели.</p>');
       put("history", d.history.map(h => '<div class="card"><div class="q">' + when(h.ts) + " · " + esc(h.q || "Глубокий разбор")
         + "</div>" + h.html + "</div>").join("") || '<p class="empty">Пока пусто.</p>');
     } else if (r.status === 404) {
-      put("now", '<p class="empty">Страница выключена. Включите её снова в панели Deck Mentor.</p>');
+      document.getElementById("askf").hidden = true;
+      put("nowbody", '<p class="empty">Страница выключена. Включите её снова в панели Deck Mentor.</p>');
       return;
     }
   } catch (e) {}
-  setTimeout(tick, busy ? 2000 : 10000);
+  busyNow = busy;
+  document.getElementById("send").disabled = busy || sending;
+  timer = setTimeout(tick, busy ? 2000 : 10000);
 }
+document.getElementById("askf").onsubmit = async (e) => {
+  e.preventDefault();
+  const box = document.getElementById("q"), err = document.getElementById("askerr");
+  const q = box.value.trim();
+  if (!q || busyNow || sending) return;
+  sending = true;
+  err.textContent = "";
+  document.getElementById("send").disabled = true;
+  try {
+    const r = await fetch(base + "/ask", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ q, shot: document.getElementById("shot").checked }) });
+    const d = await r.json();
+    if (d.ok) { box.value = ""; box.blur(); } else err.textContent = d.error || "Не получилось";
+  } catch (x) { err.textContent = "Нет связи с Декой"; }
+  sending = false;
+  tick();
+};
 tick();
 </script></body></html>
 """

@@ -4,7 +4,7 @@ export const EVENT = "deck_mentor_event";
 export const HOTKEY_EVENT = "deck_mentor_hotkey";
 
 export type Mode = "quick" | "deep" | "recap" | "achievements";
-export type Origin = "panel" | "hotkey" | "voice";
+export type Origin = "panel" | "hotkey" | "voice" | "phone";
 export const SPOILER_MARK = "<<<SPOILER>>>";
 
 export interface Settings {
@@ -143,6 +143,7 @@ export interface CliInfo {
 }
 
 export type BackendEvent =
+  | { id: string; type: "started"; request: Request }
   | { id: string; type: "status"; text: string }
   | { id: string; type: "text"; delta: string }
   | { id: string; type: "warning"; text: string }

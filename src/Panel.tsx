@@ -9,7 +9,7 @@ import type { CliInfo, Limits, Mode, State } from "./backend";
 import { Answer } from "./Answer";
 import { SettingsRows } from "./Settings";
 import {
-  achievementSummary, openReader, runningGame, setCachedSettings, setCurrent, setLimits, setPanelOpen, startAsk,
+  achievementSummary, openReader, panelUi, runningGame, setCachedSettings, setCurrent, setLimits, setPanelOpen, startAsk,
   useCurrent, useLimits,
 } from "./store";
 
@@ -85,7 +85,7 @@ function GameSection({ state, appid, name, refresh }: { state: State; appid: num
       </PanelSectionRow>
       <PanelSectionRow>
         <ToggleField label="📱 Гайд и ответы на телефоне" disabled={phoneBusy}
-          description="Откроет страницу для телефона в той же Wi-Fi сети. Только чтение, выключится сама через 3 часа."
+          description="Страница для телефона в той же Wi-Fi сети: гайд, ответы и поле для вопроса с нормальной клавиатурой. Выключится сама через 3 часа."
           checked={phone.running} onChange={togglePhone} />
       </PanelSectionRow>
       {phone.running && phone.url && (
@@ -264,11 +264,19 @@ function MicButton({ onText, disabled }: { onText: (t: string) => void; disabled
 export function Panel() {
   const [state, setState] = useState<State | null>(null);
   const [cli, setCli] = useState<CliInfo | null>(null);
-  const [question, setQuestion] = useState("");
-  const [withShot, setWithShot] = useState(true);
+  const [question, setQuestionState] = useState(panelUi.question);
+  const [withShot, setWithShotState] = useState(panelUi.withShot);
   const [notes, setNotesText] = useState("");
-  const [showHistory, setShowHistory] = useState(false);
-  const [showSettings, setShowSettings] = useState(false);
+  const [showHistory, setShowHistoryState] = useState(panelUi.showHistory);
+  const [showSettings, setShowSettingsState] = useState(panelUi.showSettings);
+  // Kept outside the component too, so they survive the panel closing.
+  const setQuestion = (v: string | ((q: string) => string)) => {
+    panelUi.question = typeof v === "function" ? v(panelUi.question) : v;
+    setQuestionState(panelUi.question);
+  };
+  const setWithShot = (v: boolean) => setWithShotState((panelUi.withShot = v));
+  const setShowHistory = (v: boolean) => setShowHistoryState((panelUi.showHistory = v));
+  const setShowSettings = (v: boolean) => setShowSettingsState((panelUi.showSettings = v));
   const [achievements, setAchievements] = useState<{ total: number; unlocked: number } | null>(null);
   const cur = useCurrent();
   const limits = useLimits();

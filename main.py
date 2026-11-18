@@ -59,7 +59,7 @@ class Plugin:
         self.last_cleanup = 0.0
         self.hotkey = HotkeyListener(decky.logger)
         self.phone_appid = 0
-        self.phone = phone.PhoneServer(decky.logger, lambda: self._phone_page())
+        self.phone = phone.PhoneServer(decky.logger, lambda: self._phone_page(), self._phone_ask)
         self.voice = Voice(decky.DECKY_PLUGIN_DIR, decky.DECKY_PLUGIN_RUNTIME_DIR, decky.logger)
         self.limits_path = os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, "limits.json")
         try:
@@ -301,6 +301,15 @@ class Plugin:
         await self.phone.stop()
         return True
 
+    async def _phone_ask(self, question: str, with_shot: bool) -> dict:
+        """A question typed on the phone page, about the game the page shows."""
+        appid = self.phone_appid
+        name = self._game(appid).data.get("name", "") if appid else ""
+        res = await self.ask(appid, name, question, with_shot and bool(appid), "quick", "phone")
+        if res.get("ok") and self.current:
+            await self._emit({"id": res["request_id"], "type": "started", "request": self.current})
+        return res
+
     def _phone_page(self) -> dict:
         state = self._game(self.phone_appid)
         cur = self.current if self.current and self.current.get("appid") == self.phone_appid else None
@@ -361,7 +370,7 @@ class Plugin:
         return True
 
     async def ask(self, appid, game_name, question, with_shot=False, mode="quick", origin="panel", facts=None):
-        """Start a request. mode: quick | deep | recap | achievements. origin: panel | hotkey | voice."""
+        """Start a request. mode: quick | deep | recap | achievements. origin: panel | hotkey | voice | phone."""
         self._ensure()
         if self.task and not self.task.done():
             return {"ok": False, "error": "Я ещё отвечаю на прошлый вопрос."}

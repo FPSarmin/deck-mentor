@@ -67,6 +67,13 @@ export function setPanelOpen(open: boolean) {
   panelOpen = open;
 }
 
+/**
+ * What the panel shows that must survive it closing: Steam unmounts the panel whenever the
+ * Quick Access menu closes (B on the keyboard, a screenshot, the reader), and a half-typed
+ * question used to vanish with it.
+ */
+export const panelUi = { question: "", withShot: true, showHistory: false, showSettings: false };
+
 const SHORTCUT_APP_TYPE = 1073741824; // k_EAppType_Shortcut: a non-Steam game added to the library
 
 export function runningGame(): { appid: number; name: string; nonSteam: boolean } {
@@ -176,6 +183,11 @@ export function handleEvent(ev: BackendEvent) {
     notify();
     return;
   }
+  if (ev.type === "started") {
+    // A question typed on the phone page: show it in the panel too.
+    if (ev.request.origin === "phone" && (!current || current.done)) setCurrent(ev.request);
+    return;
+  }
   if (!current || current.id !== ev.id) {
     if (ev.type === "done" && ev.origin !== "panel") showAnswerToast(ev.answer, ev.error, ev.game);
     return;
@@ -251,8 +263,18 @@ export let readerContent: { title: string; text: string } = { title: "", text: "
 
 export const READER_ROUTE = "/deck-mentor-reader";
 
+let readerFromPanel = false;
+
 export function openReader(title: string, text: string) {
   readerContent = { title, text };
+  readerFromPanel = true;
   Navigation.CloseSideMenus();
   Navigation.Navigate(READER_ROUTE);
+}
+
+/** The reader page went away (its own button or Steam's B): bring the plugin panel back. */
+export function readerClosed() {
+  if (!readerFromPanel) return;
+  readerFromPanel = false;
+  setTimeout(() => Navigation.OpenQuickAccessMenu(DECKY_TAB), 150);
 }

@@ -407,9 +407,10 @@ def test_phone_html():
     assert phone.to_html("") == ""
 
 
-def _http_get(port, path):
+def _http_get(port, path, method="GET", body=b"", ctype="application/json"):
     with socket.create_connection(("127.0.0.1", port), timeout=5) as conn:
-        conn.sendall(f"GET {path} HTTP/1.1\r\nHost: x\r\n\r\n".encode())
+        extra = f"Content-Type: {ctype}\r\nContent-Length: {len(body)}\r\n" if method == "POST" else ""
+        conn.sendall(f"{method} {path} HTTP/1.1\r\nHost: x\r\n{extra}\r\n".encode() + body)
         data = b""
         while True:
             chunk = conn.recv(65536)
@@ -426,7 +427,13 @@ def test_phone_server():
         "history": [{"q": "Где ключ?", "a": "У статуи", "ts": 1, "ok": True}],
         "current": {"question": "Что делать?", "text": "Иду", "answer": "", "done": False, "status": "Ищу в сети"},
     }
-    server = phone.PhoneServer(logging.getLogger("test"), lambda: page)
+    asked = []
+
+    async def ask(q, shot):
+        asked.append((q, shot))
+        return {"ok": len(asked) == 1, "error": "" if len(asked) == 1 else "Я ещё отвечаю на прошлый вопрос."}
+
+    server = phone.PhoneServer(logging.getLogger("test"), lambda: page, ask)
     original = phone.local_ip
     phone.local_ip = lambda: "127.0.0.1"
 
@@ -445,6 +452,17 @@ def test_phone_server():
         assert code == 200 and data["game"] == "Savage Wind" and "<h3>Где ты</h3>" in data["guide"]
         assert data["current"]["status"] == "Ищу в сети" and data["history"][0]["q"] == "Где ключ?"
         assert (await get("/"))[0] == 404 and (await get("/wrong/data"))[0] == 404
+        post = lambda path, body, ctype="application/json": loop.run_in_executor(  # noqa: E731
+            None, _http_get, port, path, "POST", body, ctype)
+        q = json.dumps({"q": "  Где ключ?  ", "shot": True}).encode()
+        code, body = await post(f"/{token}/ask", q)
+        assert code == 200 and json.loads(body)["ok"] and asked == [("Где ключ?", True)]
+        code, body = await post(f"/{token}/ask", q)
+        assert not json.loads(body)["ok"] and "отвечаю" in json.loads(body)["error"]
+        assert (await post(f"/{token}/ask", b"q=x", "application/x-www-form-urlencoded"))[0] == 415
+        assert (await post(f"/{token}/ask", b'{"q": "  "}'))[0] == 400
+        assert (await post(f"/{token}/ask", b"x" * 9000))[0] == 413
+        assert (await post("/wrong/ask", q))[0] == 405 and len(asked) == 2
         again = await server.start()  # extends the timer, keeps the address
         assert again["url"] == status["url"]
         await server.stop()
