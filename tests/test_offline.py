@@ -479,6 +479,25 @@ def test_phone_server():
         phone.local_ip = original
 
 
+def test_followups_and_progress_task():
+    answer, nxt = prompts.split_followups("Иди к мосту.\n<<<SPOILER>>>\nБей сзади.\n<<<NEXT>>> Где это? | «А если нет?» | Где это? | Что дальше? | Ещё")
+    assert answer == "Иди к мосту.\n<<<SPOILER>>>\nБей сзади." and nxt == ["Где это?", "А если нет?", "Что дальше?"]
+    assert prompts.split_followups("Просто ответ") == ("Просто ответ", [])
+    assert prompts.split_followups("Ответ\n<<<NEXT>>>") == ("Ответ", [])
+    assert prompts.NEXT_MARK in prompts.SYSTEM_PROMPT
+    task = prompts.progress_task("Savage Wind", "/games/sw", "hint", True, "zelda.fandom.com")
+    assert "./tools/" in task and "missable" in task and "/games/sw" in task and "zelda.fandom.com" in task
+    assert prompts.SPOILER_MARK in task and "1. Где ты сейчас" in task
+    assert "./tools/" in prompts.deep_task("X", None, "full", False, "")
+    server = phone.PhoneServer(logging.getLogger("test"), lambda: {
+        "game": "G", "guide": "", "history": [],
+        "current": {"question": "q", "text": "Ответ\n<<<NEXT>>> Где | Ещё", "answer": "", "done": True,
+                    "followups": ["Где", "Ещё"]},
+    })
+    data = server.data()
+    assert "NEXT" not in data["current"]["html"] and data["current"]["next"] == ["Где", "Ещё"]
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

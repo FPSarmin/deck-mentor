@@ -17,7 +17,11 @@ const QUICK: { label: string; q: string; shot: boolean; mode: Mode }[] = [
   { label: "📷 Что мне делать?", q: "Что мне сейчас делать? Подскажи по скриншоту.", shot: true, mode: "quick" },
   { label: "📷 Как пройти это?", q: "Как пройти то, что на скриншоте: бой, головоломку или препятствие?", shot: true, mode: "quick" },
   { label: "📷 Объясни экран", q: "Объясни, что сейчас на экране: интерфейс, предметы, характеристики.", shot: true, mode: "quick" },
-  { label: "🧭 Что я пропустил?", q: "Что важного я мог пропустить на текущем этапе игры?", shot: false, mode: "quick" },
+  {
+    label: "🔎 Проверь прогресс",
+    q: "Перепроверь мой текущий прогресс по сохранениям и скажи, что я мог упустить.",
+    shot: true, mode: "progress",
+  },
   {
     label: "⏪ На чём я остановился?",
     q: "На чём я остановился? Коротко напомни, что я делал в прошлый раз и что собирался делать дальше.",
@@ -52,8 +56,22 @@ const SPOILER_OPTIONS = [
   { data: "full", label: "Полное решение сразу" },
 ];
 
-/** Per-game settings and the phone page. */
-function GameSection({ state, appid, name, refresh }: { state: State; appid: number; name: string; refresh: () => void }) {
+/** A row that opens and closes a group of rarely used rows, so the panel stays short. */
+function Fold({ label, open, onToggle, children }: { label: string; open: boolean; onToggle: () => void; children: any }) {
+  return (
+    <>
+      <PanelSectionRow>
+        <ButtonItem layout="below" onClick={onToggle}>{open ? "▾" : "▸"} {label}</ButtonItem>
+      </PanelSectionRow>
+      {open && children}
+    </>
+  );
+}
+
+/** Per-game settings, the note for Claude and the phone page. */
+function GameRows({ state, appid, name, refresh, notes, onNotes }: {
+  state: State; appid: number; name: string; refresh: () => void; notes: string; onNotes: (v: string) => void;
+}) {
   const [phoneError, setPhoneError] = useState("");
   const [phoneBusy, setPhoneBusy] = useState(false);
   const phone = state.phone;
@@ -74,7 +92,10 @@ function GameSection({ state, appid, name, refresh }: { state: State; appid: num
     refresh();
   };
   return (
-    <PanelSection title="Эта игра">
+    <>
+      <PanelSectionRow>
+        <LazyTextField label="Где я сейчас (заметка для Claude)" value={notes} delay={1500} onCommit={onNotes} />
+      </PanelSectionRow>
       <PanelSectionRow>
         <DropdownItem label="Спойлеры в этой игре" selectedOption={state.game.spoiler} rgOptions={SPOILER_OPTIONS}
           onChange={(o) => setGame({ spoiler: o.data })} />
@@ -97,7 +118,14 @@ function GameSection({ state, appid, name, refresh }: { state: State; appid: num
         </PanelSectionRow>
       )}
       {phoneError && <PanelSectionRow><div style={{ fontSize: "12px", color: "#ff8080" }}>{phoneError}</div></PanelSectionRow>}
-    </PanelSection>
+      {state.game.guide && (
+        <PanelSectionRow>
+          <ButtonItem layout="below" onClick={async () => { await api.deleteGuide(appid); refresh(); }}>
+            Удалить гайд
+          </ButtonItem>
+        </PanelSectionRow>
+      )}
+    </>
   );
 }
 
@@ -206,11 +234,11 @@ function AnswerActions({ title, text, shown, full, tts }: { title: string; text:
   );
 }
 
-function CurrentAnswer({ tts }: { tts: boolean }) {
+function CurrentAnswer({ tts, onFollowup, canAsk }: { tts: boolean; onFollowup: (q: string) => void; canAsk: boolean }) {
   const cur = useCurrent();
   if (!cur) return null;
   const busy = !cur.done;
-  const text = cur.done ? cur.answer || cur.text : cur.text;
+  const text = api.stripNext(cur.done ? cur.answer || cur.text : cur.text);
   const title = cur.mode === "deep" ? "🔬 Глубокий разбор" : cur.question;
   return (
     <PanelSectionRow>
@@ -228,6 +256,16 @@ function CurrentAnswer({ tts }: { tts: boolean }) {
             actions={cur.done ? (shown, full) => <AnswerActions title={title} text={text} shown={shown} full={full} tts={tts} /> : undefined} />
         )}
         {cur.done && cur.error && <div style={{ fontSize: "12px", color: "#ff8080", marginTop: "4px", whiteSpace: "pre-wrap" }}>{cur.error}</div>}
+        {cur.done && !!cur.followups?.length && (
+          <Focusable style={{ display: "flex", flexDirection: "column", gap: "4px", marginTop: "8px" }}>
+            {cur.followups.map((q) => (
+              <DialogButton key={q} disabled={!canAsk} onClick={() => onFollowup(q)}
+                style={{ ...smallButton, textAlign: "left", padding: "6px 10px" }}>
+                ↪ {q}
+              </DialogButton>
+            ))}
+          </Focusable>
+        )}
       </div>
     </PanelSectionRow>
   );
@@ -269,6 +307,7 @@ export function Panel() {
   const [notes, setNotesText] = useState("");
   const [showHistory, setShowHistoryState] = useState(panelUi.showHistory);
   const [showSettings, setShowSettingsState] = useState(panelUi.showSettings);
+  const [showGame, setShowGameState] = useState(panelUi.showGame);
   // Kept outside the component too, so they survive the panel closing.
   const setQuestion = (v: string | ((q: string) => string)) => {
     panelUi.question = typeof v === "function" ? v(panelUi.question) : v;
@@ -277,6 +316,7 @@ export function Panel() {
   const setWithShot = (v: boolean) => setWithShotState((panelUi.withShot = v));
   const setShowHistory = (v: boolean) => setShowHistoryState((panelUi.showHistory = v));
   const setShowSettings = (v: boolean) => setShowSettingsState((panelUi.showSettings = v));
+  const setShowGame = (v: boolean) => setShowGameState((panelUi.showGame = v));
   const [achievements, setAchievements] = useState<{ total: number; unlocked: number } | null>(null);
   const cur = useCurrent();
   const limits = useLimits();
@@ -344,7 +384,7 @@ export function Panel() {
       {cli && !ready && <Setup cli={cli} onRetry={recheck} />}
       <PanelSection title={game.name || "Игра не запущена"}>
         {s?.auth_mode === "subscription" && <LimitsLine limits={limits} />}
-        <CurrentAnswer tts={tts} />
+        <CurrentAnswer tts={tts} canAsk={!busy && !!ready} onFollowup={(q) => ask(q, false)} />
         {busy && (
           <PanelSectionRow>
             <ButtonItem layout="below" onClick={() => api.cancel()}>Остановить</ButtonItem>
@@ -382,77 +422,62 @@ export function Panel() {
         </PanelSectionRow>
       </PanelSection>
 
-      {game.appid > 0 && state && <GameSection state={state} appid={game.appid} name={game.name} refresh={refresh} />}
-
       {game.appid > 0 && (
-        <PanelSection title="Глубокий разбор">
-          <PanelSectionRow>
-            <div style={small}>
-              Claude скопирует сохранения, изучит файлы игры и интернет и напишет гайд по твоему прохождению.
-              Занимает 3–10 минут, можно играть дальше. Свой вопрос выше тоже учтётся.
-            </div>
-          </PanelSectionRow>
-          <PanelSectionRow>
-            <ButtonItem layout="below" disabled={busy || !ready}
-              onClick={() => { startAsk(question.trim(), false, "deep", "panel"); setQuestion(""); }}>
-              🔬 {state?.game.guide ? "Обновить гайд" : "Разобрать сохранения"}
-            </ButtonItem>
-          </PanelSectionRow>
-          {state?.game.guide && (
-            <>
-              <PanelSectionRow>
-                <ButtonItem layout="below" onClick={() => openReader(`Гайд: ${game.name}`, state.game.guide)}>
-                  📖 Открыть гайд
-                </ButtonItem>
-              </PanelSectionRow>
-              <PanelSectionRow>
-                <ButtonItem layout="below" onClick={async () => { await api.deleteGuide(game.appid); refresh(); }}>
-                  Удалить гайд
-                </ButtonItem>
-              </PanelSectionRow>
-            </>
+        <PanelSection title="Гайд по прохождению">
+          {!state?.game.guide && (
+            <PanelSectionRow>
+              <div style={small}>
+                Claude скопирует сохранения, изучит файлы игры и интернет и напишет гайд по твоему прохождению.
+                Займёт 3–10 минут, можно играть дальше. Свой вопрос выше тоже учтётся.
+              </div>
+            </PanelSectionRow>
           )}
           <PanelSectionRow>
-            <LazyTextField label="Где я сейчас (заметка для Claude)" value={notes} delay={1500}
-              onCommit={(v) => { setNotesText(v); api.setNotes(game.appid, v); }} />
+            <Focusable style={{ display: "flex", gap: "6px" }}>
+              {state?.game.guide && (
+                <DialogButton style={{ ...smallButton, fontSize: "14px" }} onClick={() => openReader(`Гайд: ${game.name}`, state.game.guide)}>
+                  📖 Открыть
+                </DialogButton>
+              )}
+              <DialogButton style={{ ...smallButton, fontSize: "14px" }} disabled={busy || !ready}
+                onClick={() => { startAsk(question.trim(), false, "deep", "panel"); setQuestion(""); }}>
+                🔬 {state?.game.guide ? "Обновить" : "Разобрать сохранения"}
+              </DialogButton>
+            </Focusable>
           </PanelSectionRow>
         </PanelSection>
       )}
 
       {state && (
-        <PanelSection title="История">
-          <PanelSectionRow>
-            <ButtonItem layout="below" onClick={() => setShowHistory(!showHistory)}>
-              {showHistory ? "Скрыть" : `Прошлые ответы (${state.game.history_total})`}
-            </ButtonItem>
-          </PanelSectionRow>
-          {showHistory && state.game.history.slice().reverse().map((h) => (
-            <PanelSectionRow key={h.ts + h.q}>
-              <div style={box}>
-                <div style={{ ...small, marginBottom: "4px" }}>{h.mode === "deep" ? "🔬 " : h.shot ? "📷 " : ""}{h.q || "Глубокий разбор"}</div>
-                <Answer text={h.a} dim={!h.ok}
-                  actions={(shown, full) => <AnswerActions title={h.q || "Глубокий разбор"} text={h.a} shown={shown} full={full} tts={tts} />} />
-              </div>
+        <PanelSection title="Ещё">
+          {game.appid > 0 && (
+            <Fold label={`Эта игра${state.phone.running ? " · 📱 телефон включён" : ""}`} open={showGame}
+              onToggle={() => setShowGame(!showGame)}>
+              <GameRows state={state} appid={game.appid} name={game.name} refresh={refresh} notes={notes}
+                onNotes={(v) => { setNotesText(v); api.setNotes(game.appid, v); }} />
+            </Fold>
+          )}
+          <Fold label={`История (${state.game.history_total})`} open={showHistory} onToggle={() => setShowHistory(!showHistory)}>
+            {state.game.history.slice().reverse().map((h) => (
+              <PanelSectionRow key={h.ts + h.q}>
+                <div style={box}>
+                  <div style={{ ...small, marginBottom: "4px" }}>{h.mode === "deep" ? "🔬 " : h.mode === "progress" ? "🔎 " : h.shot ? "📷 " : ""}{h.q || "Глубокий разбор"}</div>
+                  <Answer text={h.a} dim={!h.ok}
+                    actions={(shown, full) => <AnswerActions title={h.q || "Глубокий разбор"} text={h.a} shown={shown} full={full} tts={tts} />} />
+                </div>
+              </PanelSectionRow>
+            ))}
+            <PanelSectionRow>
+              <ButtonItem layout="below" disabled={busy}
+                onClick={async () => { await api.newChat(game.appid); setCurrent(null); refresh(); }}>
+                Новый разговор
+              </ButtonItem>
             </PanelSectionRow>
-          ))}
-          <PanelSectionRow>
-            <ButtonItem layout="below" disabled={busy}
-              onClick={async () => { await api.newChat(game.appid); setCurrent(null); refresh(); }}>
-              Новый разговор
-            </ButtonItem>
-          </PanelSectionRow>
-        </PanelSection>
-      )}
-
-      {s && state && (
-        <PanelSection title="Настройки">
-          <PanelSectionRow>
-            <ButtonItem layout="below" onClick={() => setShowSettings(!showSettings)}>
-              {showSettings ? "Скрыть настройки" : "Показать настройки"}
-            </ButtonItem>
-          </PanelSectionRow>
-          {showSettings && (
-            <SettingsRows state={state} cli={cli} busy={busy} update={update} refresh={refresh} />
+          </Fold>
+          {s && (
+            <Fold label="Настройки" open={showSettings} onToggle={() => setShowSettings(!showSettings)}>
+              <SettingsRows state={state} cli={cli} busy={busy} update={update} refresh={refresh} />
+            </Fold>
           )}
         </PanelSection>
       )}

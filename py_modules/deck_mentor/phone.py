@@ -17,7 +17,7 @@ import socket
 import time
 from typing import Awaitable, Callable
 
-from .prompts import SPOILER_MARK
+from .prompts import SPOILER_MARK, split_followups
 
 PORTS = (8765, 8766, 8767, 18765, 28765)
 LIFETIME = 3 * 3600
@@ -164,8 +164,9 @@ class PhoneServer:
             "guide": to_html(page.get("guide") or ""),
             "current": cur and {
                 "question": cur.get("question") or ("Глубокий разбор" if cur.get("mode") == "deep" else ""),
-                "html": to_html(cur.get("answer") or cur.get("text") or ""),
+                "html": to_html(split_followups(cur.get("answer") or cur.get("text") or "")[0]),
                 "done": bool(cur.get("done")),
+                "next": [str(q) for q in cur.get("followups") or []][:3],
                 "status": cur.get("status") or "",
             },
             "history": history,
@@ -253,7 +254,9 @@ textarea{width:100%;background:var(--bg);color:var(--text);border:1px solid #3a4
 .ask{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:8px}
 .ask label{color:var(--dim);font-size:15px}.err{color:#ff8080;font-size:14px}
 button.send{background:var(--accent);color:#06121f;border:0;border-radius:8px;font:inherit;font-weight:600;padding:9px 18px}
-button.send:disabled{opacity:.5}
+button.send:disabled,button.chip:disabled{opacity:.5}
+.chips{display:flex;flex-direction:column;gap:6px;margin-top:10px}
+button.chip{text-align:left;background:none;color:var(--accent);border:1px solid #3a4350;border-radius:8px;font:inherit;padding:8px 10px}
 </style></head><body>
 <header><h1 id="game">Deck Mentor</h1>
 <nav><button data-tab="now" class="on">Сейчас</button><button data-tab="guide">Гайд</button><button data-tab="history">История</button></nav></header>
@@ -283,8 +286,10 @@ async function tick() {
       document.getElementById("game").textContent = d.game;
       const c = d.current, last = d.history[0];
       busy = !!(c && !c.done);
+      const chips = c && c.done && c.next && c.next.length ? '<div class="chips">' + c.next.map((q) =>
+        '<button class="chip" data-q="' + esc(q) + '">↪ ' + esc(q) + "</button>").join("") + "</div>" : "";
       const now = c ? '<div class="card"><div class="q">' + esc(c.question) + "</div>" + (c.html || "")
-        + (busy ? '<div class="status">⏳ ' + esc(c.status || "Думаю…") + "</div>" : "") + "</div>"
+        + (busy ? '<div class="status">⏳ ' + esc(c.status || "Думаю…") + "</div>" : "") + chips + "</div>"
         : last ? '<div class="card"><div class="q">' + esc(last.q) + "</div>" + last.html + "</div>"
         : '<p class="empty">Задайте вопрос в Deck Mentor на Деке, и ответ появится здесь.</p>';
       put("nowbody", now);
@@ -301,22 +306,32 @@ async function tick() {
   document.getElementById("send").disabled = busy || sending;
   timer = setTimeout(tick, busy ? 2000 : 10000);
 }
-document.getElementById("askf").onsubmit = async (e) => {
-  e.preventDefault();
-  const box = document.getElementById("q"), err = document.getElementById("askerr");
-  const q = box.value.trim();
-  if (!q || busyNow || sending) return;
+async function send(q, shot) {
+  const err = document.getElementById("askerr");
+  if (!q || busyNow || sending) return false;
   sending = true;
   err.textContent = "";
   document.getElementById("send").disabled = true;
+  let ok = false;
   try {
     const r = await fetch(base + "/ask", { method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ q, shot: document.getElementById("shot").checked }) });
+      body: JSON.stringify({ q, shot }) });
     const d = await r.json();
-    if (d.ok) { box.value = ""; box.blur(); } else err.textContent = d.error || "Не получилось";
+    ok = !!d.ok;
+    if (!ok) err.textContent = d.error || "Не получилось";
   } catch (x) { err.textContent = "Нет связи с Декой"; }
   sending = false;
   tick();
+  return ok;
+}
+document.getElementById("askf").onsubmit = async (e) => {
+  e.preventDefault();
+  const box = document.getElementById("q");
+  if (await send(box.value.trim(), document.getElementById("shot").checked)) { box.value = ""; box.blur(); }
+};
+document.getElementById("nowbody").onclick = (e) => {
+  const chip = e.target.closest("button.chip");
+  if (chip) { chip.disabled = true; send(chip.dataset.q, false); }
 };
 tick();
 </script></body></html>

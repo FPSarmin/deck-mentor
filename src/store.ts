@@ -72,7 +72,7 @@ export function setPanelOpen(open: boolean) {
  * Quick Access menu closes (B on the keyboard, a screenshot, the reader), and a half-typed
  * question used to vanish with it.
  */
-export const panelUi = { question: "", withShot: true, showHistory: false, showSettings: false };
+export const panelUi = { question: "", withShot: true, showHistory: false, showSettings: false, showGame: false };
 
 const SHORTCUT_APP_TYPE = 1073741824; // k_EAppType_Shortcut: a non-Steam game added to the library
 
@@ -153,7 +153,7 @@ const DECKY_TAB = 999 as any;
 /** Start a request. Screenshots are taken with the menu closed, then the menu reopens. */
 export async function startAsk(question: string, withShot: boolean, mode: api.Mode, origin: api.Origin) {
   const game = runningGame();
-  const factsPromise = gameFacts(mode === "achievements");
+  const factsPromise = gameFacts(mode === "achievements" || mode === "progress");
   if (withShot && origin === "panel") {
     reopenAfterCapture = true;
     Navigation.CloseSideMenus();
@@ -211,7 +211,7 @@ export function handleEvent(ev: BackendEvent) {
       }
       break;
     case "done":
-      Object.assign(next, { done: true, ok: ev.ok, answer: ev.answer, error: ev.error, status: "" });
+      Object.assign(next, { done: true, ok: ev.ok, answer: ev.answer, error: ev.error, status: "", followups: ev.followups || [] });
       if (reopenAfterCapture) {
         reopenAfterCapture = false; // failed before the screenshot: bring the menu back anyway
         Navigation.OpenQuickAccessMenu(DECKY_TAB);
@@ -225,12 +225,14 @@ export function handleEvent(ev: BackendEvent) {
 }
 
 function showAnswerToast(answer: string, error: string, game: string, mode?: api.Mode) {
-  const title = mode === "deep" ? "Гайд готов" : game ? `Подсказка: ${game}` : "Подсказка";
+  const title = mode === "deep" ? "Гайд готов" : mode === "progress" ? "Прогресс проверен"
+    : game ? `Подсказка: ${game}` : "Подсказка";
   toaster.toast({
     title,
     body: answer ? shorten(answer) : error || "Нет ответа",
     duration: answer ? 15000 : 6000,
-    onClick: () => Navigation.OpenQuickAccessMenu(DECKY_TAB),
+    // One tap opens the whole answer on the full screen; B goes straight back to the game.
+    onClick: () => (answer ? openReader(title, answer, false) : Navigation.OpenQuickAccessMenu(DECKY_TAB)),
   });
 }
 
@@ -265,9 +267,9 @@ export const READER_ROUTE = "/deck-mentor-reader";
 
 let readerFromPanel = false;
 
-export function openReader(title: string, text: string) {
+export function openReader(title: string, text: string, fromPanel = true) {
   readerContent = { title, text };
-  readerFromPanel = true;
+  readerFromPanel = fromPanel;
   Navigation.CloseSideMenus();
   Navigation.Navigate(READER_ROUTE);
 }

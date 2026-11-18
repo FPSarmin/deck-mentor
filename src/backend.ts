@@ -3,7 +3,7 @@ import { addEventListener, callable } from "@decky/api";
 export const EVENT = "deck_mentor_event";
 export const HOTKEY_EVENT = "deck_mentor_hotkey";
 
-export type Mode = "quick" | "deep" | "recap" | "achievements";
+export type Mode = "quick" | "deep" | "recap" | "achievements" | "progress";
 export type Origin = "panel" | "hotkey" | "voice" | "phone";
 export const SPOILER_MARK = "<<<SPOILER>>>";
 
@@ -91,6 +91,8 @@ export interface Request {
   answer: string;
   error: string;
   warning?: string;
+  /** Follow-up questions Claude suggested, shown as buttons under the answer. */
+  followups?: string[];
 }
 
 export interface HistoryEntry {
@@ -148,7 +150,10 @@ export type BackendEvent =
   | { id: string; type: "text"; delta: string }
   | { id: string; type: "warning"; text: string }
   | { id: string; type: "captured"; ok: boolean }
-  | { id: string; type: "done"; ok: boolean; answer: string; error: string; origin: Origin; mode: Mode; game: string }
+  | {
+      id: string; type: "done"; ok: boolean; answer: string; error: string; followups?: string[];
+      origin: Origin; mode: Mode; game: string;
+    }
   | { id: string; type: "limits"; limits: Limits }
   | { id: string; type: "download"; kind: "stt" | "tts"; progress: number };
 
@@ -193,6 +198,12 @@ export const checkUpdate = callable<[force: boolean], UpdateInfo | null>("check_
 export function installUpdate(url: string, version: string) {
   const backend = (window as any).DeckyBackend;
   return backend.call("utilities/install_plugin", url, "Deck Mentor", version, false, 2 /* UPDATE */);
+}
+
+/** While an answer streams in, hide the follow-up line Claude writes at its end. */
+export function stripNext(text: string): string {
+  const i = text.indexOf("<<<NEXT>>>");
+  return i < 0 ? text : text.slice(0, i).trimEnd();
 }
 
 export function splitSpoiler(text: string): [string, string] {

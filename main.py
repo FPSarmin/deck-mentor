@@ -317,7 +317,7 @@ class Plugin:
             "game": state.data.get("name") or "Deck Mentor",
             "guide": state.guide(),
             "history": state.data.get("history", [])[-40:],
-            "current": cur and {k: cur.get(k) for k in ("question", "text", "answer", "done", "status", "mode")},
+            "current": cur and {k: cur.get(k) for k in ("question", "text", "answer", "done", "status", "mode", "followups")},
         }
 
     async def set_notes(self, appid, notes):
@@ -370,16 +370,16 @@ class Plugin:
         return True
 
     async def ask(self, appid, game_name, question, with_shot=False, mode="quick", origin="panel", facts=None):
-        """Start a request. mode: quick | deep | recap | achievements. origin: panel | hotkey | voice | phone."""
+        """Start a request. mode: quick | deep | recap | achievements | progress. origin: panel | hotkey | voice | phone."""
         self._ensure()
         if self.task and not self.task.done():
             return {"ok": False, "error": "Я ещё отвечаю на прошлый вопрос."}
-        mode = mode if mode in ("quick", "deep", "recap", "achievements") else "quick"
+        mode = mode if mode in ("quick", "deep", "recap", "achievements", "progress") else "quick"
         request_id = uuid.uuid4().hex[:12]
         self.current = {
             "id": request_id, "appid": int(appid or 0), "game": game_name or "", "question": question or "",
             "mode": mode, "origin": origin, "shot": bool(with_shot), "text": "", "tools": [],
-            "status": "Запускаю…", "done": False, "ok": False, "answer": "", "error": "",
+            "status": "Запускаю…", "done": False, "ok": False, "answer": "", "error": "", "followups": [],
             "started": time.time(),
         }
         if int(appid or 0):
@@ -489,15 +489,16 @@ class Plugin:
         self.current["status"] = text
         await self._emit({"id": rid, "type": "status", "text": text})
 
-    async def _finish(self, rid, ok, answer="", error=""):
+    async def _finish(self, rid, ok, answer="", error="", followups=()):
         cur = self.current
-        cur.update(done=True, ok=ok, answer=answer, error=error, status="")
+        cur.update(done=True, ok=ok, answer=answer, error=error, status="", followups=list(followups))
         await self._emit({"id": rid, "type": "done", "ok": ok, "answer": answer, "error": error,
-                          "origin": cur["origin"], "mode": cur["mode"], "game": cur["game"]})
+                          "followups": list(followups), "origin": cur["origin"], "mode": cur["mode"],
+                          "game": cur["game"]})
 
     async def _run(self, rid, appid, game_name, question, with_shot, mode, origin, facts=None):
         state = self._game(appid)
-        deep = mode == "deep"
+        deep = mode in ("deep", "progress")  # both copy the saves and let Claude parse them
         try:
             claude = claude_cli.find_claude(self.settings["claude_path"])
             if not claude:
@@ -549,7 +550,10 @@ class Plugin:
                 # (Claude Code still auto-allows read-only commands such as ls or strings).
                 allowed = ["Read", "Glob", "Grep", "Edit(./**)", "Write(./**)",
                            "Bash(python3 *)", "Bash(rm -rf ./scratch)"] + web
-                text = prompts.deep_task(game_name, install, spoiler, bool(copied["sources"]), question, wiki)
+                if mode == "progress":
+                    text = prompts.progress_task(game_name, install, spoiler, bool(copied["sources"]), wiki)
+                else:
+                    text = prompts.deep_task(game_name, install, spoiler, bool(copied["sources"]), question, wiki)
                 effort = "medium" if self.settings["effort"] == "low" else self.settings["effort"]
                 max_turns = int(self.settings["deep_max_turns"])
                 timeout = DEEP_TIMEOUT
@@ -605,13 +609,17 @@ class Plugin:
                 answer = self.current.get("text", "").strip() if result.get("subtype") == "error_max_turns" else ""
                 if answer:
                     error = "Не хватило шагов, ответ может быть неполным."
+            answer, followups = prompts.split_followups(answer)
             state.data["turns"] = state.data.get("turns", 0) + 1
             if png_b64:
                 state.data["shots"] = state.data.get("shots", 0) + 1
-            label = question if not deep else ("Глубокий разбор" + (f": {question}" if question else ""))
+            if mode == "progress":
+                label = "Проверка прогресса"
+            else:
+                label = question if not deep else ("Глубокий разбор" + (f": {question}" if question else ""))
             state.record(label, answer or error, bool(png_b64), mode, ok)
             state.save()
-            await self._finish(rid, ok or bool(answer), answer=answer, error=error)
+            await self._finish(rid, ok or bool(answer), answer=answer, error=error, followups=followups)
             if (answer and origin in ("hotkey", "voice") and self.settings["tts_enabled"]
                     and self.settings["tts_auto"]):
                 self._speak_later(answer.split(prompts.SPOILER_MARK)[0])

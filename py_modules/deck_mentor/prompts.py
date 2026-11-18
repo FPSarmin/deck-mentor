@@ -42,12 +42,32 @@ are missable (can be lost forever after some point), and say before which moment
 hidden achievements are about unless spoiler_level is "full".
 - <player_notes> and <game_guide> hold what is already known about this playthrough. Treat them as \
 background, and when the screenshot or question contradicts them, trust the screenshot and question.
+- End every reply with one last line that starts with <<<NEXT>>> and lists 2-3 short follow-up questions \
+the player is likely to ask next, in the player's language, each under 40 characters, separated by " | ". \
+The panel turns them into buttons, so the player doesn't have to type. Example: \
+<<<NEXT>>> Где это на карте? | А если не выходит? | Что дальше?
 """
 
 SPOILER_LABELS = {"hint": "hint", "balanced": "balanced", "full": "full"}
 
 
 SPOILER_MARK = "<<<SPOILER>>>"
+NEXT_MARK = "<<<NEXT>>>"
+
+
+def split_followups(text: str) -> tuple[str, list[str]]:
+    """'answer\n<<<NEXT>>> a | b' -> ('answer', ['a', 'b']). The marker line never reaches the player."""
+    text = str(text or "")
+    head, mark, tail = text.rpartition(NEXT_MARK)
+    if not mark:
+        return text.strip(), []
+    line, _, rest = tail.partition("\n")
+    items = []
+    for item in line.split("|"):
+        item = item.strip().strip("-•*\"«»").strip()
+        if item and item not in items:
+            items.append(item[:80])
+    return (head.rstrip() + ("\n" + rest.strip() if rest.strip() else "")).strip(), items[:3]
 
 
 def facts_block(facts: dict | None) -> str:
@@ -134,13 +154,8 @@ def context_block(game_name: str, appid: int | None, spoiler: str, notes: str, g
     return "\n".join(parts)
 
 
-def deep_task(game_name: str, install_dir: str | None, spoiler: str, has_saves: bool, focus: str,
-              wiki: str = "") -> str:
-    lines = [
-        f"Deep analysis for {game_name or 'this game'}.",
-        "",
-        "Your working directory contains:",
-    ]
+def _workdir(has_saves: bool, install_dir: str | None) -> list[str]:
+    lines = ["Your working directory contains:"]
     if has_saves:
         lines.append("- ./saves/ : a COPY of what looks like this game's saves and settings (Proton prefix, Steam Cloud, "
                      "other launchers, the running game's own folder, ports and emulators). ./saves/SOURCES.txt says "
@@ -150,35 +165,79 @@ def deep_task(game_name: str, install_dir: str | None, spoiler: str, has_saves: 
     else:
         lines.append("- No save files were found for this game. ./saves/SOURCES.txt lists the game's running "
                      "processes, which may still tell you what it is. Say in the guide that the saves were not "
-                     "found and work from the player's notes and question and from the web.")
+                     "found and work from the player's notes and question, the screenshot if there is one, "
+                     "and the web.")
     if install_dir:
         lines.append(f"- The game's install folder, read-only: {install_dir}")
     lines += [
         "- ./guide.md : your guide from earlier analyses, if one exists. Update it rather than starting over.",
-        "",
+        "- ./tools/ : save-parsing scripts you wrote in earlier analyses, if any. Run and reuse them first: it is "
+        "much faster than starting over. Keep scripts that work there for next time; throwaway files go to ./scratch/.",
+    ]
+    return lines
+
+
+_SAVES_HOWTO = ("Use the saves first. They are often binary: write small Python 3 scripts to parse them "
+                "(Unreal Engine games usually use the GVAS format; look for readable strings, names of areas, bosses "
+                "and items). Cross-check names against the game's data files and the web (wikis, guides). Write names "
+                "as the game shows them, with a translation in parentheses when the game's language differs from the "
+                "guide's.")
+
+_RULES = ("Rules: never modify, move or delete anything outside your working directory, including the original "
+          "saves and the game folder. Don't install packages. Delete ./scratch/ when you are done.")
+
+GUIDE_SECTIONS = ["1. Где ты сейчас", "2. Что делать дальше (3-5 конкретных шагов)", "3. Что ты пропустил поблизости",
+                  "4. Билд и снаряжение", "5. Источники (ссылки)"]
+
+
+def deep_task(game_name: str, install_dir: str | None, spoiler: str, has_saves: bool, focus: str,
+              wiki: str = "") -> str:
+    lines = [f"Deep analysis for {game_name or 'this game'}.", "", *_workdir(has_saves, install_dir), ""]
+    lines += [
         "Goal: work out exactly where the player is right now (story progress, current area, level and stats, "
         "key items and equipment, bosses beaten, side content done or missed) and what they should do next.",
-        "Use the saves first. They are often binary: write small Python 3 scripts in ./scratch/ to parse them "
-        "(Unreal Engine games usually use the GVAS format; look for readable strings, names of areas, bosses and "
-        "items). Cross-check names against the game's data files and the web (wikis, guides). Write names as the "
-        "game shows them, with a translation in parentheses when the game's language differs from the guide's.",
+        _SAVES_HOWTO,
         "",
         "Then write ./guide.md in the player's language (Russian by default) with these sections:",
-        "1. Где ты сейчас",
-        "2. Что делать дальше (3-5 конкретных шагов)",
-        "3. Что ты пропустил поблизости",
-        "4. Билд и снаряжение",
-        "5. Источники (ссылки)",
+        *GUIDE_SECTIONS,
         "Keep it under about 1200 words, short lines, no tables.",
         f"Spoiler level: {SPOILER_LABELS.get(spoiler, 'balanced')}. In 'hint' and 'balanced' mode, write sections "
         f"2 and 3 as nudges and put the exact solutions at the very end of the file after a line {SPOILER_MARK}.",
         "",
-        "Rules: never modify, move or delete anything outside your working directory, including the original "
-        "saves and the game folder. Don't install packages. Delete ./scratch/ when you are done.",
+        _RULES,
         "Finish with a 4-6 line summary of the most useful findings.",
     ]
     if wiki.strip():
         lines += ["", f"The player prefers this source; check it first: {wiki.strip()[:200]}"]
     if focus.strip():
         lines += ["", f"The player especially wants to know: {focus.strip()}"]
+    return "\n".join(lines)
+
+
+def progress_task(game_name: str, install_dir: str | None, spoiler: str, has_saves: bool, wiki: str = "") -> str:
+    """The "check my progress" button: re-read the saves and list what the player may have missed so far."""
+    lines = [f"Progress check for {game_name or 'this game'}.", "", *_workdir(has_saves, install_dir), ""]
+    lines += [
+        "Goal: the player may have played since the guide was written. Re-check where they are now from the saves "
+        "(and the screenshot, if attached), then find what they may have missed in the areas and chapters they "
+        "have already passed: side quests, collectibles, upgrades, NPCs and shops, optional bosses, and above all "
+        "missable things that are lost for good after some story point. Take the checklist of those areas from "
+        "the wiki or guides and compare it with the saves. <game_facts> may list achievements not unlocked yet.",
+        _SAVES_HOWTO,
+        "",
+        "Your reply is what the player reads in the narrow side panel, in their language:",
+        "- one line: where they are now (area, story point);",
+        "- up to 8 bullets of what they missed, most important first: what it is, roughly where, and if it is "
+        "missable, before which moment;",
+        "- if nothing important is missed, say so in one line.",
+        f"Spoiler level: {SPOILER_LABELS.get(spoiler, 'balanced')}. In 'hint' and 'balanced' mode keep the bullets "
+        f"as nudges and put exact locations and solutions after a line {SPOILER_MARK}.",
+        "",
+        "Also update ./guide.md: rewrite sections 1 and 3 with what you found and keep the rest. If there is no "
+        "guide yet, write one with these sections: " + "; ".join(GUIDE_SECTIONS) + ".",
+        "",
+        _RULES,
+    ]
+    if wiki.strip():
+        lines += ["", f"The player prefers this source; check it first: {wiki.strip()[:200]}"]
     return "\n".join(lines)
