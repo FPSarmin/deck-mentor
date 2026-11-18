@@ -28,7 +28,8 @@ async def download(url: str, dest: str, on_progress: Progress | None = None, exp
 
     size = 0
     proc = await asyncio.create_subprocess_exec(
-        curl, "-sSIL", url, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL, env=env)
+        curl, "-sSIL", "--connect-timeout", "15", "--max-time", "30", url,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL, env=env)
     out, _ = await proc.communicate()
     for line in out.decode(errors="ignore").splitlines():
         if line.lower().startswith("content-length:"):
@@ -38,7 +39,9 @@ async def download(url: str, dest: str, on_progress: Progress | None = None, exp
                 pass
 
     proc = await asyncio.create_subprocess_exec(
-        curl, "-fsSL", "--retry", "3", "-o", tmp, url,
+        # Give up when the connection stalls (under 4 KB/s for 45 s) instead of hanging forever.
+        curl, "-fsSL", "--retry", "3", "--connect-timeout", "20", "--speed-limit", "4096", "--speed-time", "45",
+        "-o", tmp, url,
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE, env=env)
     while proc.returncode is None:
         try:

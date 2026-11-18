@@ -82,13 +82,24 @@ class Plugin:
     async def _unload(self):
         if getattr(self, "_ready", False):
             self.hotkey.stop()
-            await self.voice.cancel_recording()
-            await self.voice.stop_speaking()
-            await self.cancel()
+            try:
+                await asyncio.wait_for(self._stop_all(), timeout=3)
+            except (asyncio.TimeoutError, OSError):
+                pass
+
+    async def _stop_all(self):
+        await self.voice.cancel_recording()
+        await self.voice.stop_speaking()
+        await self.cancel()
 
     async def _uninstall(self):
+        # Decky also calls this when it *updates* the plugin, so only temporary files go;
+        # chat history, guides and Claude Code's transcripts stay.
         if getattr(self, "_ready", False):
-            await self.cleanup_now(True)
+            try:
+                await asyncio.wait_for(self._cleanup(False), timeout=5)
+            except (asyncio.TimeoutError, OSError):
+                pass
 
     # ---------------------------------------------------------------- helpers
     def _game(self, appid) -> GameState:
@@ -339,6 +350,8 @@ class Plugin:
             return {"ok": False, "error": str(exc)}
         finally:
             self.voice.busy_downloading = False
+            # Always end the progress bar, also when the download failed.
+            await self._emit({"id": "setup", "type": "download", "kind": kind, "progress": 1.0})
 
     async def voice_remove(self):
         self._ensure()

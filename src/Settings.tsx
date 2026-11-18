@@ -3,7 +3,7 @@ import { LazyTextField } from "./Fields";
 import { useState } from "react";
 import * as api from "./backend";
 import type { CliInfo, Settings, State } from "./backend";
-import { useDownload } from "./store";
+import { clearDownload, useDownload } from "./store";
 
 const small = { fontSize: "12px", opacity: 0.7 };
 export const mb = (n: number) => `${(n / 1e6).toFixed(n < 1e7 ? 1 : 0)} МБ`;
@@ -31,7 +31,8 @@ export function SettingsRows({ state, cli, busy, update, refresh }: Props) {
     if (!on) return update({ [key]: false } as Partial<Settings>);
     const ready = kind === "stt" ? state.voice.stt_model : state.voice.tts_engine && state.voice.tts_voice;
     if (!ready) {
-      const r = await api.voiceSetup(kind);
+      const r = await api.voiceSetup(kind).catch((e) => ({ ok: false, error: String(e) }));
+      clearDownload();
       if (!r.ok) {
         setVoiceError(r.error || "Не удалось скачать");
         return;

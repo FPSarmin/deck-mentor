@@ -44,6 +44,11 @@ export const useCurrent = () => useStore(() => current);
 export const useLimits = () => useStore(() => limits);
 export const useDownload = () => useStore(() => download);
 
+export function clearDownload() {
+  download = null;
+  notify();
+}
+
 export function setCurrent(req: Request | null) {
   current = req;
   notify();
