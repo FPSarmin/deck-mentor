@@ -23,7 +23,6 @@ DEFAULT_SETTINGS: dict = {
     "max_storage_mb": 0,            # 0 = no size cap on transcripts
     "deep_max_turns": 40,
     "voice_enabled": False,
-    "voice_combo": "L5+R5",         # hold to talk
     "voice_model": "base",          # base (57 MB) | small (181 MB, more accurate)
     "voice_language": "ru",
     "tts_enabled": False,

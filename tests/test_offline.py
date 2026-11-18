@@ -159,6 +159,28 @@ def test_hotkey_bindings():
     assert calls == ["hint", "listen", "release"], calls
 
 
+def test_hotkey_tap_or_hold():
+    """One combination, two meanings: a tap asks about the screen, a hold is push-to-talk."""
+    calls = []
+    lst = hotkey.HotkeyListener(logging.getLogger("t"))
+    lst._bindings = [hotkey.Binding("L4+R4", 0.6, lambda: calls.append("hold"), lambda: calls.append("release"),
+                                    on_press=lambda: calls.append("press"), on_tap=lambda: calls.append("tap"))]
+    lst.feed({"L4", "R4"}, 0.0)
+    lst.feed({"L4", "R4"}, 0.3)
+    lst.feed({"R4"}, 0.4)
+    assert calls == ["press", "tap"], calls
+    calls.clear()
+    lst.feed({"L4", "R4"}, 1.0)
+    lst.feed({"L4", "R4", "A"}, 1.7)
+    lst.feed({"L4", "R4"}, 3.0)
+    lst.feed(set(), 3.5)
+    assert calls == ["press", "hold", "release"], calls
+    calls.clear()
+    lst.feed({"L4"}, 4.0)
+    lst.feed(set(), 4.1)
+    assert calls == []
+
+
 def test_hotkey_loop_reads_only_changes():
     """Run the real read loop on a socket that keeps message boundaries like hidraw does."""
     calls = []

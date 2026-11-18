@@ -23,7 +23,6 @@ export interface Settings {
   max_storage_mb: number;
   deep_max_turns: number;
   voice_enabled: boolean;
-  voice_combo: string;
   voice_model: string;
   voice_language: string;
   tts_enabled: boolean;

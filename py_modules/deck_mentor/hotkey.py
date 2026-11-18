@@ -66,14 +66,22 @@ def _find_device() -> str | None:
 
 
 class Binding:
-    """A button combination: `on_hold` fires once it is held long enough, `on_release` when let go."""
+    """A button combination.
 
-    def __init__(self, combo: str, hold: float, on_hold: Callable[[], None],
-                 on_release: Callable[[], None] | None = None) -> None:
+    `on_press` fires as soon as the combination is down, `on_hold` once it has been held for
+    `hold` seconds, `on_release` when it is let go after that, and `on_tap` when it is let go
+    sooner. So one combination can mean two things: a tap and a hold.
+    """
+
+    def __init__(self, combo: str, hold: float, on_hold: Callable[[], None] | None,
+                 on_release: Callable[[], None] | None = None, on_press: Callable[[], None] | None = None,
+                 on_tap: Callable[[], None] | None = None) -> None:
         self.buttons = COMBOS.get(combo, COMBOS["L4+R4"])
         self.hold = max(0.1, hold)
         self.on_hold = on_hold
         self.on_release = on_release
+        self.on_press = on_press
+        self.on_tap = on_tap
         self.since: float | None = None
         self.fired = False
 
@@ -143,12 +151,15 @@ class HotkeyListener:
             if b.buttons <= buttons:
                 if b.since is None:
                     b.since = now
+                    self._call(b.on_press)
                 elif not b.fired and now - b.since >= b.hold:
                     b.fired = True
                     self._call(b.on_hold)
             else:
                 if b.fired:
                     self._call(b.on_release)
+                elif b.since is not None:
+                    self._call(b.on_tap)
                 b.since = None
                 b.fired = False
 

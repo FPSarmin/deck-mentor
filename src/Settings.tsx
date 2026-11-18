@@ -84,25 +84,26 @@ export function SettingsRows({ state, cli, busy, update, refresh }: Props) {
 
       <PanelSectionRow>
         <ToggleField label="Горячая клавиша: подсказка по экрану"
-          description={`Зажмите кнопки, и ответ придёт уведомлением. Статус: ${state.hotkey_status}`}
+          description={`Коротко нажмите ${s.hotkey_combo}, и Claude ответит по скриншоту уведомлением. Статус: ${state.hotkey_status}`}
           checked={s.hotkey_enabled} onChange={(v) => update({ hotkey_enabled: v })} />
       </PanelSectionRow>
+      {(s.hotkey_enabled || s.voice_enabled) && (
+        <PanelSectionRow>
+          <DropdownItem label="Кнопки" selectedOption={s.hotkey_combo} onChange={(o) => update({ hotkey_combo: o.data })}
+            rgOptions={state.combos.map((c) => ({ data: c, label: c }))} />
+        </PanelSectionRow>
+      )}
       {s.hotkey_enabled && (
-        <>
-          <PanelSectionRow>
-            <DropdownItem label="Кнопки" selectedOption={s.hotkey_combo} onChange={(o) => update({ hotkey_combo: o.data })}
-              rgOptions={state.combos.map((c) => ({ data: c, label: c }))} />
-          </PanelSectionRow>
-          <PanelSectionRow>
-            <LazyTextField label="Вопрос для горячей клавиши" value={s.hotkey_question} delay={1500}
-              onCommit={(v) => update({ hotkey_question: v })} />
-          </PanelSectionRow>
-        </>
+        <PanelSectionRow>
+          <LazyTextField label="Вопрос для горячей клавиши" value={s.hotkey_question} delay={1500}
+            onCommit={(v) => update({ hotkey_question: v })} />
+        </PanelSectionRow>
       )}
 
       <PanelSectionRow>
         <ToggleField label="🎤 Голосовой вопрос"
-          description={`Зажмите ${s.voice_combo}, скажите вопрос и отпустите. Распознаётся на Деке, только пока говорите. `
+          description={`Зажмите ${s.hotkey_combo} и говорите, отпустите, когда закончите. Короткое нажатие по-прежнему даёт подсказку по экрану. `
+            + "Распознаётся на Деке, только пока кнопки зажаты. "
             + (state.voice.stt_model ? "" : `Скачает модель ~${state.voice_options.models[s.voice_model] || 60} МБ.`)}
           checked={s.voice_enabled} disabled={!!dl || !state.voice.stt_binary}
           onChange={(v) => enableWithDownload("stt", "voice_enabled", v)} />
@@ -110,10 +111,6 @@ export function SettingsRows({ state, cli, busy, update, refresh }: Props) {
       {!state.voice.stt_binary && <PanelSectionRow><div style={small}>В этой сборке нет распознавателя речи.</div></PanelSectionRow>}
       {s.voice_enabled && (
         <>
-          <PanelSectionRow>
-            <DropdownItem label="Кнопки для голоса" selectedOption={s.voice_combo} onChange={(o) => update({ voice_combo: o.data })}
-              rgOptions={state.combos.filter((c) => c !== s.hotkey_combo).map((c) => ({ data: c, label: c }))} />
-          </PanelSectionRow>
           <PanelSectionRow>
             <DropdownItem label="Точность распознавания" selectedOption={s.voice_model}
               onChange={async (o) => { await update({ voice_model: o.data }); await enableWithDownload("stt", "voice_enabled", true); }}

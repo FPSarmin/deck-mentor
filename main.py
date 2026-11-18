@@ -26,6 +26,7 @@ from deck_mentor.voice import PIPER_VOICES, WHISPER_MODELS, Voice, VoiceError  #
 
 EVENT = "deck_mentor_event"
 HOTKEY_EVENT = "deck_mentor_hotkey"
+VOICE_HOLD = 0.6  # seconds: a shorter press of the hotkey asks about the screen, a longer one records
 QUICK_TIMEOUT = 240
 DEEP_TIMEOUT = 1500
 CLEANUP_EVERY = 6 * 3600
@@ -58,6 +59,8 @@ class Plugin:
         self.cli_info = None
         self.last_cleanup = 0.0
         self.hotkey = HotkeyListener(decky.logger)
+        self.voice_lock = asyncio.Lock()
+        self.voice_error = ""
         self.phone_appid = 0
         self.phone = phone.PhoneServer(decky.logger, lambda: self._phone_page(), self._phone_ask)
         self.voice = Voice(decky.DECKY_PLUGIN_DIR, decky.DECKY_PLUGIN_RUNTIME_DIR, decky.logger)
@@ -129,31 +132,53 @@ class Plugin:
         await decky.emit(HOTKEY_EVENT, payload)
 
     def _apply_hotkey(self):
+        """One combination for everything: a short press asks about the screen, holding it records a question."""
+        run = self._from_thread
+        combo = self.settings["hotkey_combo"]
         bindings = []
-        if self.settings["hotkey_enabled"]:
-            bindings.append(Binding(self.settings["hotkey_combo"], 0.35,
-                                    lambda: self._from_thread(lambda: self._hotkey_event({"kind": "hint"}))))
-        if self.settings["voice_enabled"] and self.settings["voice_combo"] != self.settings["hotkey_combo"]:
-            bindings.append(Binding(self.settings["voice_combo"], 0.25,
-                                    lambda: self._from_thread(self._voice_hold),
-                                    lambda: self._from_thread(self._voice_release)))
+        if self.settings["voice_enabled"]:
+            bindings.append(Binding(combo, VOICE_HOLD, lambda: run(self._voice_hold), lambda: run(self._voice_release),
+                                    on_press=lambda: run(self._voice_press), on_tap=lambda: run(self._voice_tap)))
+        elif self.settings["hotkey_enabled"]:
+            bindings.append(Binding(combo, 0.35, lambda: run(lambda: self._hotkey_event({"kind": "hint"}))))
         self.hotkey.set_bindings(bindings)
 
-    # Push-to-talk: hold the voice combo, speak, let go.
+    # Push-to-talk on the same combination: recording starts the moment the buttons go down, so
+    # the first words aren't lost, but nothing is shown until the press turns out to be a hold.
+    async def _voice_press(self):
+        async with self.voice_lock:
+            self.voice_error = ""
+            if self.task and not self.task.done():
+                return
+            try:
+                if not os.path.isfile(self.voice.model_path(self.settings["voice_model"])):
+                    raise VoiceError("Модель распознавания не скачана: откройте настройки голоса.")
+                await self.voice.stop_speaking()
+                await self.voice.start_recording()
+            except (VoiceError, OSError) as exc:
+                self.voice_error = str(exc)
+
     async def _voice_hold(self):
-        if self.task and not self.task.done():
-            await self._hotkey_event({"kind": "voice_error", "text": "Ещё думаю над прошлым вопросом…"})
-            return
-        try:
-            if not os.path.isfile(self.voice.model_path(self.settings["voice_model"])):
-                raise VoiceError("Модель распознавания не скачана: откройте настройки голоса.")
-            await self.voice.stop_speaking()
-            await self.voice.start_recording()
-            await self._hotkey_event({"kind": "voice_listening"})
-        except (VoiceError, OSError) as exc:
-            await self._hotkey_event({"kind": "voice_error", "text": str(exc)})
+        async with self.voice_lock:
+            if self.task and not self.task.done():
+                await self._hotkey_event({"kind": "voice_error", "text": "Ещё думаю над прошлым вопросом…"})
+            elif self.voice_error or not self.voice.recording:
+                await self._hotkey_event({"kind": "voice_error", "text": self.voice_error or "Микрофон не включился."})
+            else:
+                await self._hotkey_event({"kind": "voice_listening"})
+
+    async def _voice_tap(self):
+        async with self.voice_lock:
+            await self.voice.cancel_recording()
+        if self.settings["hotkey_enabled"]:
+            await self._hotkey_event({"kind": "hint"})
 
     async def _voice_release(self):
+        async with self.voice_lock:
+            if self.voice.recording:
+                await self._voice_finish()
+
+    async def _voice_finish(self):
         try:
             wav = await self.voice.stop_recording()
             await self._hotkey_event({"kind": "voice_transcribing"})
@@ -255,9 +280,9 @@ class Plugin:
         patch = dict(patch or {})
         if patch.get("api_key", "").startswith("••••"):
             patch.pop("api_key")
-        for key in ("hotkey_combo", "voice_combo"):
-            if key in patch and patch[key] not in COMBOS:
-                patch.pop(key)
+        if "hotkey_combo" in patch and patch["hotkey_combo"] not in COMBOS:
+            patch.pop("hotkey_combo")
+        patch.pop("voice_combo", None)  # voice now shares the hotkey (hold it)
         if patch.get("voice_model") not in (None, *WHISPER_MODELS):
             patch.pop("voice_model")
         if patch.get("tts_voice") not in (None, *PIPER_VOICES):
@@ -265,7 +290,7 @@ class Plugin:
         if patch.get("quick_model") not in (None, "same", "opus", "sonnet", "haiku"):
             patch.pop("quick_model")
         data = self.settings.update(patch)
-        if {"hotkey_enabled", "hotkey_combo", "voice_enabled", "voice_combo"} & patch.keys():
+        if {"hotkey_enabled", "hotkey_combo", "voice_enabled"} & patch.keys():
             self._apply_hotkey()
         if {"auth_mode", "api_key", "claude_path"} & patch.keys():
             self.cli_info = None

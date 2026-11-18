@@ -130,6 +130,10 @@ class Voice:
             return [which("arecord", env), "-q", "-f", "S16_LE", "-r", "16000", "-c", "1", path]
         return None
 
+    @property
+    def recording(self) -> bool:
+        return self._rec is not None
+
     async def start_recording(self) -> None:
         if self._rec:
             return
