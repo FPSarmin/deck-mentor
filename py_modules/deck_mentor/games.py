@@ -8,6 +8,7 @@ import re
 import shutil
 import time
 
+from . import running
 from .util import user_home
 
 _VDF_PAIR = re.compile(r'"([^"]+)"\s+"([^"]*)"')
@@ -16,7 +17,8 @@ _VDF_PAIR = re.compile(r'"([^"]+)"\s+"([^"]*)"')
 _SKIP_DIRS = re.compile(
     r"^(temp|tmp|cache|caches|.*cache|shadercache|d3dscache|nvidia|amd|microsoft|"
     r"crashes|crashreport.*|crashdumps|logs?|webcache|cef|gpucache|htmlcache|"
-    r"steam|unity|epic.*|ubisoft game launcher|origin|ea desktop|package cache)$",
+    r"steam|unity|epic.*|ubisoft game launcher|origin|ea desktop|package cache|"
+    r"mods?|textures?|texture_packs|shaders?|assets|screenshots|videos|baseroms?|roms)$",
     re.IGNORECASE,
 )
 # Places inside steamuser where games keep saves and settings.
@@ -86,14 +88,32 @@ _NOT_GAMES = {
 def _matches(dirname: str, names: list[str]) -> bool:
     """Folder or file name vs. game name. Loose enough for "Game (USA)", strict enough to skip "Data"."""
     d = _norm(dirname)
-    if len(d) < 4 or d in _NOT_GAMES:
+    if len(d) < 3 or d in _NOT_GAMES:
         return False
     for n in names:
-        if not n or len(n) < 4:
+        if not n or len(n) < 3:
             continue
-        if d == n or (n in d and len(n) * 2 >= len(d)) or (d in n and len(d) >= 6 and len(d) * 2 >= len(n)):
+        if d == n:  # short names like "soh" or "pd" only count when they match exactly
+            return True
+        if len(n) < 4 or len(d) < 4:
+            continue
+        if (n in d and len(n) * 2 >= len(d)) or (d in n and len(d) >= 6 and len(d) * 2 >= len(n)):
             return True
     return False
+
+
+# Unofficial PC ports keep saves under the port's own name, not the game's title.
+_PORT_ALIASES = [
+    (("ocarinaoftime", "shipofharkinian", "harkinian"), ("soh", "shipofharkinian")),
+    (("majorasmask", "2ship", "2s2h", "zelda64"), ("2ship", "2ship2harkinian", "2s2h", "zelda64recompiled", "zelda64")),
+    (("linktothepast", "zelda3"), ("zelda3",)),
+    (("starfox64", "starship"), ("starship",)),
+    (("supermario64", "sm64"), ("sm64ex", "sm64", "sm64coopdx", "render96ex", "sm64plus")),
+    (("perfectdark",), ("perfectdark", "pd")),
+    (("jakanddaxter", "jak2", "jakii", "opengoal"), ("opengoal",)),
+    (("supermetroid",), ("sm", "supermetroid")),
+    (("supermarioworld",), ("smw",)),
+]
 
 
 def _children(path: str) -> list[str]:
@@ -103,12 +123,18 @@ def _children(path: str) -> list[str]:
         return []
 
 
-def _names(game_name: str, appid: int) -> list[str]:
+def _names(game_name: str, appid: int, extra: list[str] | tuple = ()) -> list[str]:
     names = [_norm(game_name)]
-    # Shortcut titles often carry a launcher prefix or a ROM extension.
+    # Shortcut titles often carry a launcher prefix, a ROM extension or ".AppImage".
     cleaned = re.sub(r"^(heroic|lutris|epic|gog)\s*[-:]\s*", "", game_name, flags=re.IGNORECASE)
     cleaned = re.sub(r"\.(iso|chd|nsp|xci|rvz|cso|zip|7z)$", "", cleaned, flags=re.IGNORECASE)
     names.append(_norm(cleaned))
+    names.append(_norm(running.stem(cleaned)))
+    names += [_norm(e) for e in extra]
+    joined = " ".join(names)
+    for keys, ports in _PORT_ALIASES:
+        if any(k in joined for k in keys):
+            names += list(ports)
     folder = None
     if appid:
         for lib in library_paths():
@@ -138,14 +164,15 @@ def guess_install_dir(appid: int, game_name: str) -> str | None:
     return None
 
 
-def other_save_sources(appid: int, game_name: str) -> list[tuple[str, str, str]]:
+def other_save_sources(appid: int, game_name: str, extra_names: list[str] | tuple = ()) -> list[tuple[str, str, str]]:
     """Save locations outside Steam's Proton prefix: (label, path, kind).
 
     kind "prefix" = a Windows user folder (copy AppData/Documents...), "dir" = copy as is,
-    "files" = a folder from which only files whose names match the game are copied.
+    "files" = a folder from which only files whose names match the game are copied,
+    "gamedir" = a game's own folder (copy save folders and small settings files only).
     """
     home = user_home()
-    names = _names(game_name, appid)
+    names = _names(game_name, appid, extra_names)
     if not names:
         return []
     found: list[tuple[str, str, str]] = []
@@ -182,6 +209,13 @@ def other_save_sources(appid: int, game_name: str) -> list[tuple[str, str, str]]
             if not _matches(base, names):
                 continue
             found.append(("native", child, "dir"))
+
+    # Ports and portable games: AppImages in ~/Applications (EmuDeck) or wherever they were unpacked.
+    for root in (os.path.join(home, "Applications"), os.path.join(home, "Applications", "Distrobox"),
+                 os.path.join(home, "Desktop"), os.path.join(home, "Games"), os.path.join(home, "Emulation", "roms", "ports")):
+        for child in _children(root):
+            if _matches(os.path.basename(child), names) and not any(child == f[1] for f in found):
+                found.append(("port", child, "gamedir"))
 
     # Emulators (EmuDeck layout): saves are named after the ROM.
     for root in (os.path.join(home, "Emulation", "saves"), os.path.join(home, "Emulation", "states")):
@@ -251,6 +285,78 @@ def _copy_matching_files(src: str, dst: str, names: list[str], budget: list[int]
                 log.append(f"copy failed: {path}: {exc}")
 
 
+_SAVE_DIR = re.compile(r"^(saves?|savedata|save ?games?|savefiles?|sram|states?|userdata|profiles?|memcards?|player)$",
+                       re.IGNORECASE)
+_SAVE_EXT = {".sav", ".save", ".srm", ".sram", ".eep", ".fla", ".mpk", ".state", ".dsv", ".json", ".ini", ".cfg",
+             ".toml", ".yaml", ".yml", ".dat", ".txt", ".xml"}
+_STRICT_SAVE_EXT = {".sav", ".save", ".srm", ".sram", ".eep", ".fla", ".mpk", ".state", ".dsv"}
+
+
+def _copy_game_dir(src: str, dst: str, budget: list[int], max_file: int, log: list[str]) -> None:
+    """A game's own folder: save-like subfolders (two levels deep) and small settings files at the top."""
+    for root, dirs, files in os.walk(src):
+        depth = root[len(src):].count(os.sep)
+        dirs[:] = [d for d in dirs if not _SKIP_DIRS.match(d) and not os.path.islink(os.path.join(root, d))]
+        for d in list(dirs):
+            if _SAVE_DIR.match(d):
+                _copy_tree(os.path.join(root, d), os.path.join(dst, os.path.relpath(root, src), d), budget, max_file, log)
+                dirs.remove(d)
+        if depth >= 1:
+            dirs[:] = []
+        for name in files:
+            path = os.path.join(root, name)
+            if os.path.splitext(name)[1].lower() not in _SAVE_EXT or os.path.islink(path):
+                continue
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                continue
+            if size > 4_000_000 or size > budget[0]:
+                continue
+            target_dir = os.path.join(dst, os.path.relpath(root, src))
+            os.makedirs(target_dir, exist_ok=True)
+            try:
+                shutil.copy2(path, os.path.join(target_dir, name))
+                budget[0] -= size
+            except OSError as exc:
+                log.append(f"copy failed: {path}: {exc}")
+
+
+_RECENT_SKIP = _NOT_GAMES | {"googlechrome", "bravesoftware", "discord", "vesktop", "code", "kwalletd", "cache",
+                             "mesashadercache", "nvidia", "qtshadercache", "tracker3", "gnomeshell", "user-places"}
+
+
+def recent_save_files(since_seconds: float = 7 * 86400, limit: int = 40, time_budget: float = 5.0) -> list[str]:
+    """Last resort: save-looking files changed recently anywhere a game might keep them."""
+    home = user_home()
+    roots = [os.path.join(home, p) for p in (".local/share", ".config", "Emulation/saves", "Applications", "Games",
+                                             "Desktop", ".var/app")]
+    now, started = time.time(), time.monotonic()
+    found: list[tuple[float, str]] = []
+    for top in roots:
+        for root, dirs, files in os.walk(top):
+            if time.monotonic() - started > time_budget:
+                break
+            depth = root[len(top):].count(os.sep)
+            dirs[:] = [] if depth >= 6 else [
+                d for d in dirs if _norm(d) not in _RECENT_SKIP and not _SKIP_DIRS.match(d) and not d.startswith(".")
+                and not os.path.islink(os.path.join(root, d))]
+            in_save_dir = bool(_SAVE_DIR.match(os.path.basename(root)))
+            for name in files:
+                ext = os.path.splitext(name)[1].lower()
+                if ext not in _STRICT_SAVE_EXT and not (in_save_dir and ext in _SAVE_EXT | {"", ".bin"}):
+                    continue
+                path = os.path.join(root, name)
+                try:
+                    st = os.stat(path)
+                except OSError:
+                    continue
+                if now - st.st_mtime <= since_seconds and st.st_size <= 16_000_000:
+                    found.append((st.st_mtime, path))
+    found.sort(reverse=True)
+    return [p for _m, p in found[:limit]]
+
+
 def copy_saves(appid: int, dest: str, max_total: int = 300_000_000, max_file: int = 64_000_000,
                game_name: str = "") -> dict:
     """Copy everything that looks like saves/settings for `appid` into `dest`.
@@ -277,11 +383,26 @@ def copy_saves(appid: int, dest: str, max_total: int = 300_000_000, max_file: in
         _copy_tree(cloud, target, budget, max_file, log)
         sources.append((target, cloud))
 
-    if game_name:
-        names = _names(game_name, appid)
-        for i, (label, src, kind) in enumerate(other_save_sources(appid, game_name)):
+    # What is actually running: the executable's and AppImage's folders and their names.
+    try:
+        hint = running.hints(appid)
+    except OSError:
+        hint = {"names": [], "dirs": [], "processes": []}
+    for i, src in enumerate(hint["dirs"]):
+        target = os.path.join(dest, f"running_game_{i}")
+        _copy_game_dir(src, target, budget, max_file, log)
+        if os.path.isdir(target):
+            sources.append((target, src))
+
+    if game_name or hint["names"]:
+        names = _names(game_name, appid, hint["names"])
+        for i, (label, src, kind) in enumerate(other_save_sources(appid, game_name, hint["names"])):
+            if any(src == s for _t, s in sources):
+                continue
             target = os.path.join(dest, f"{label}_{i}")
-            if kind == "prefix":
+            if kind == "gamedir":
+                _copy_game_dir(src, target, budget, max_file, log)
+            elif kind == "prefix":
                 for sub in _PREFIX_ROOTS:
                     if os.path.isdir(os.path.join(src, sub)):
                         _copy_tree(os.path.join(src, sub), os.path.join(target, sub.replace("/", "_")), budget, max_file, log)
@@ -291,6 +412,23 @@ def copy_saves(appid: int, dest: str, max_total: int = 300_000_000, max_file: in
                 _copy_tree(src, target, budget, max_file, log)
             if os.path.isdir(target):
                 sources.append((target, src))
+
+    # Nothing by name or by process: offer recently changed save-looking files instead.
+    recent: list[str] = []
+    if not _has_files(dest):
+        home = user_home()
+        for path in recent_save_files():
+            size = os.path.getsize(path)
+            if size > budget[0]:
+                continue
+            target = os.path.join(dest, "recent", os.path.relpath(path, home))
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            try:
+                shutil.copy2(path, target)
+                budget[0] -= size
+                recent.append(path)
+            except OSError as exc:
+                log.append(f"copy failed: {path}: {exc}")
 
     # Drop empty folders so the model is not distracted by them.
     for root, dirs, files in os.walk(dest, topdown=False):
@@ -306,12 +444,27 @@ def copy_saves(appid: int, dest: str, max_total: int = 300_000_000, max_file: in
         for target, src in sources:
             fh.write(f"  {os.path.relpath(target, dest)}  <-  {src}\n")
         if not sources:
-            fh.write("  (no save folders found: not in Proton, Steam Cloud, Heroic, Lutris, Bottles, native or emulator folders)\n")
+            fh.write("  (no save folders found: not in Proton, Steam Cloud, Heroic, Lutris, Bottles, ports, native "
+                     "or emulator folders)\n")
+        if recent:
+            fh.write("\nGUESSES: save-looking files changed in the last 7 days anywhere in the home folder "
+                     "(copied to ./recent/ by their path). Some may belong to other games:\n")
+            for path in recent:
+                fh.write(f"  {path}\n")
+        if hint["processes"]:
+            fh.write("\nThe game's running processes (what Steam launched):\n")
+            for line in hint["processes"]:
+                fh.write(f"  {line}\n")
         for line in log[:50]:
             fh.write(line + "\n")
 
     return {
         "copied_bytes": max_total - budget[0],
-        "sources": [src for _t, src in sources],
+        "sources": [src for _t, src in sources] + recent,
         "prefix": prefix,
+        "game_dir": hint["dirs"][0] if hint["dirs"] else None,
     }
+
+
+def _has_files(path: str) -> bool:
+    return any(files for _r, _d, files in os.walk(path))

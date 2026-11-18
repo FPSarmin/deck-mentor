@@ -13,7 +13,7 @@ import zlib
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "py_modules"))
 
-from deck_mentor import capture, cleanup, games, hotkey, prompts  # noqa: E402
+from deck_mentor import capture, cleanup, games, hotkey, prompts, running  # noqa: E402
 from deck_mentor.voice import Voice  # noqa: E402
 
 
@@ -240,6 +240,96 @@ def test_speakable():
     assert Voice.speakable(text) == "Иди к мосту.. Возьми ключ. Открой дверь".replace("..", ".")
     long = "Слово. " * 300
     assert len(Voice.speakable(long)) <= 700
+
+
+def _fake_proc(root, pid, ppid, argv, exe="", cwd="", env=None, start=100):
+    d = os.path.join(root, str(pid))
+    os.makedirs(d)
+    comm = os.path.basename(argv[0])[:15]
+    rest = ["S", str(ppid)] + ["0"] * 17 + [str(start)] + ["0"] * 10
+    open(os.path.join(d, "stat"), "w").write(f"{pid} ({comm}) " + " ".join(rest))
+    open(os.path.join(d, "cmdline"), "wb").write(b"\0".join(a.encode() for a in argv) + b"\0")
+    open(os.path.join(d, "environ"), "wb").write(b"\0".join(f"{k}={v}".encode() for k, v in (env or {}).items()))
+    if exe:
+        os.symlink(exe, os.path.join(d, "exe"))
+    if cwd:
+        os.symlink(cwd, os.path.join(d, "cwd"))
+
+
+def test_port_saves_from_running_process():
+    """Ship of Harkinian as an AppImage shortcut: saves sit next to the AppImage in Save/."""
+    with tempfile.TemporaryDirectory() as home:
+        home = os.path.realpath(home)
+        os.environ["DECKY_USER_HOME"] = home
+        port = os.path.join(home, "Applications", "ShipofHarkinian")
+        os.makedirs(os.path.join(port, "Save"))
+        os.makedirs(os.path.join(port, "mods"))
+        open(os.path.join(port, "soh.AppImage"), "wb").write(b"\0" * 5_000_000)
+        open(os.path.join(port, "Save", "file1.sav"), "w").write('{"sections": {"base": {"data": {"entranceIndex": 1}}}}')
+        open(os.path.join(port, "shipofharkinian.json"), "w").write("{}")
+        open(os.path.join(port, "mods", "pack.o2r"), "wb").write(b"1" * 100)
+
+        proc = os.path.join(home, "proc")
+        appimage = os.path.join(port, "soh.AppImage")
+        _fake_proc(proc, 1, 0, ["/sbin/init"])
+        _fake_proc(proc, 100, 1, [home + "/.local/share/Steam/ubuntu12_32/reaper", "SteamLaunch", "AppId=3141592653",
+                                  "--", appimage], exe=home + "/.local/share/Steam/ubuntu12_32/reaper", cwd=home)
+        _fake_proc(proc, 101, 100, ["/tmp/.mount_sohAbC/usr/bin/soh.elf"], exe="/tmp/.mount_sohAbC/usr/bin/soh.elf",
+                   cwd=port, env={"APPIMAGE": appimage, "OWD": home, "PATH": "/usr/bin"})
+        _fake_proc(proc, 200, 1, ["/usr/bin/konsole"], exe="/usr/bin/konsole", cwd=home)
+
+        h = running.hints(3141592653, proc)
+        assert "soh" in [games._norm(n) for n in h["names"]], h
+        assert h["dirs"] == [port], h
+        assert any("soh.elf" in line for line in h["processes"]), h
+        assert running.hints(1, proc)["dirs"] == [port]  # unknown appid: falls back to the newest reaper
+
+        original = running.hints
+        running.hints = lambda appid: original(appid, proc)
+        try:
+            dest = os.path.join(home, "out")
+            info = games.copy_saves(3141592653, dest, game_name="soh.AppImage")
+            copied = sorted(os.path.relpath(os.path.join(r, f), dest) for r, _, fs in os.walk(dest) for f in fs)
+            assert "running_game_0/Save/file1.sav" in copied, copied
+            assert "running_game_0/shipofharkinian.json" in copied, copied
+            assert not any(c.endswith((".AppImage", ".o2r")) for c in copied), copied
+            assert info["game_dir"] == port
+            sources_txt = open(os.path.join(dest, "SOURCES.txt")).read()
+            assert "soh.elf" in sources_txt and port in sources_txt, sources_txt
+
+            # No process info (e.g. analysis started after quitting): the title alone still finds the port.
+            running.hints = lambda appid: {"names": [], "dirs": [], "processes": []}
+            dest2 = os.path.join(home, "out2")
+            games.copy_saves(2952790016, dest2, game_name="The Legend of Zelda: Ocarina of Time")
+            copied = [os.path.relpath(os.path.join(r, f), dest2) for r, _, fs in os.walk(dest2) for f in fs]
+            assert any(c.endswith("Save/file1.sav") for c in copied), copied
+
+            # Nothing matches at all: recently changed save-looking files are offered as guesses.
+            other = os.path.join(home, ".config", "weirdport", "saves")
+            os.makedirs(other)
+            open(os.path.join(other, "slot1.dat"), "wb").write(b"x" * 10)
+            old = os.path.join(home, ".config", "oldgame", "saves")
+            os.makedirs(old)
+            open(os.path.join(old, "slot1.sav"), "wb").write(b"x")
+            os.utime(os.path.join(old, "slot1.sav"), (time.time() - 30 * 86400,) * 2)
+            dest3 = os.path.join(home, "out3")
+            info = games.copy_saves(123, dest3, game_name="Something Else Entirely")
+            copied = [os.path.relpath(os.path.join(r, f), dest3) for r, _, fs in os.walk(dest3) for f in fs]
+            assert "recent/.config/weirdport/saves/slot1.dat" in copied, copied
+            assert not any("oldgame" in c for c in copied), copied
+            assert "GUESSES" in open(os.path.join(dest3, "SOURCES.txt")).read()
+        finally:
+            running.hints = original
+            del os.environ["DECKY_USER_HOME"]
+
+
+def test_stem():
+    assert running.stem("/a/Ship-of-Harkinian-x86_64.AppImage") == "Ship-of-Harkinian"
+    assert running.stem("/a/Zelda64Recompiled-x86_64.AppImage") == "Zelda64Recompiled"
+    assert running.stem("soh.elf") == "soh"
+    assert running.stem("2ship.AppImage") == "2ship"
+    assert running.stem("/x/launchers/soh.sh") == "soh"
+    assert games._matches("soh", ["soh"]) and not games._matches("sohx", ["soh"]) and not games._matches("pd", ["pd"])
 
 
 if __name__ == "__main__":

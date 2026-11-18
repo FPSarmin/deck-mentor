@@ -457,7 +457,7 @@ class Plugin:
                 copied = await asyncio.to_thread(games.copy_saves, appid, saves_dir, 300_000_000, 64_000_000,
                                                  game_name)
                 os.makedirs(os.path.join(state.dir, "scratch"), exist_ok=True)
-                install = await asyncio.to_thread(games.guess_install_dir, appid, game_name)
+                install = await asyncio.to_thread(games.guess_install_dir, appid, game_name) or copied.get("game_dir")
                 if install:
                     extra_args += ["--add-dir", install]
                 tools = ["Read", "Glob", "Grep", "Bash", "Write", "Edit"] + web

@@ -88,10 +88,15 @@ def deep_task(game_name: str, install_dir: str | None, spoiler: str, has_saves: 
         "Your working directory contains:",
     ]
     if has_saves:
-        lines.append("- ./saves/ : a COPY of this game's save files and settings (Proton prefix and Steam Cloud). "
-                     "./saves/SOURCES.txt says where each folder came from.")
+        lines.append("- ./saves/ : a COPY of what looks like this game's saves and settings (Proton prefix, Steam Cloud, "
+                     "other launchers, the running game's own folder, ports and emulators). ./saves/SOURCES.txt says "
+                     "where each folder came from and which processes the game runs as. Files under ./saves/recent/ "
+                     "are only guesses (recently changed save-looking files): first work out by path and content "
+                     "which of them belong to this game, and ignore the rest.")
     else:
-        lines.append("- No save files were found for this game (it may be a native Linux game or store saves elsewhere).")
+        lines.append("- No save files were found for this game. ./saves/SOURCES.txt lists the game's running "
+                     "processes, which may still tell you what it is. Say in the guide that the saves were not "
+                     "found and work from the player's notes and question and from the web.")
     if install_dir:
         lines.append(f"- The game's install folder, read-only: {install_dir}")
     lines += [
