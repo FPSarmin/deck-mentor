@@ -75,8 +75,24 @@ export function runningGame(): { appid: number; name: string; nonSteam: boolean 
   return { appid: Number(app.appid) || 0, name: app.display_name || "", nonSteam: app.app_type === SHORTCUT_APP_TYPE };
 }
 
+/** Steam's achievement summary for the running game, or null (non-Steam, none, not loaded). */
+export async function achievementSummary(): Promise<{ total: number; unlocked: number } | null> {
+  const game = runningGame();
+  if (!game.appid || game.nonSteam) return null;
+  try {
+    const store = (window as any).appDetailsStore;
+    if (store?.RequestAchievements) {
+      await Promise.race([store.RequestAchievements(game.appid), new Promise((r) => setTimeout(r, 1500))]);
+    }
+    const a = store?.GetAchievements?.(game.appid);
+    return a && a.nTotal > 0 ? { total: a.nTotal, unlocked: a.nAchieved } : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Playtime and unlocked achievements, when the launcher has them. Never blocks for long. */
-async function gameFacts(): Promise<Facts | null> {
+async function gameFacts(withMissing = false): Promise<Facts | null> {
   const app = Router.MainRunningApp as any;
   if (!app) return null;
   const game = runningGame();
@@ -99,6 +115,17 @@ async function gameFacts(): Promise<Facts | null> {
           .sort((x: any, y: any) => (y.rtUnlocked || 0) - (x.rtUnlocked || 0))
           .slice(0, 15)
           .map((x: any) => ({ name: x.strName || x.strID, description: x.strDescription || "" }));
+        if (withMissing) {
+          const seenMissing = new Set<string>();
+          facts.missing_achievements = all
+            .filter((x: any) => x && !x.bAchieved && !seenMissing.has(x.strID) && seenMissing.add(x.strID))
+            .slice(0, 80)
+            .map((x: any) => ({
+              name: x.strName || x.strID,
+              description: x.strDescription || "",
+              hidden: !!x.bHidden,
+            }));
+        }
       }
     } catch {
       // achievements are optional
@@ -119,7 +146,7 @@ const DECKY_TAB = 999 as any;
 /** Start a request. Screenshots are taken with the menu closed, then the menu reopens. */
 export async function startAsk(question: string, withShot: boolean, mode: api.Mode, origin: api.Origin) {
   const game = runningGame();
-  const factsPromise = gameFacts();
+  const factsPromise = gameFacts(mode === "achievements");
   if (withShot && origin === "panel") {
     reopenAfterCapture = true;
     Navigation.CloseSideMenus();

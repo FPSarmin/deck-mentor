@@ -12,6 +12,7 @@ DEFAULT_SETTINGS: dict = {
     "api_key": "",
     "claude_path": "",
     "model": "opus",                # opus | sonnet | haiku
+    "quick_model": "sonnet",        # hotkey and voice answers: same | opus | sonnet | haiku
     "effort": "low",                # low | medium | high
     "spoiler": "balanced",          # hint | balanced | full
     "web_search": True,
@@ -81,7 +82,7 @@ class GameState:
         self.dir = os.path.join(games_dir, str(appid))
         self.path = os.path.join(self.dir, "state.json")
         self.data = {"session_id": None, "turns": 0, "shots": 0, "notes": "", "history": [],
-                     "sessions": [], **_read_json(self.path)}
+                     "sessions": [], "name": "", "spoiler": "", "wiki": "", **_read_json(self.path)}
 
     @property
     def guide_path(self) -> str:

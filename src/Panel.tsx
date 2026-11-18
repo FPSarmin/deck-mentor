@@ -1,21 +1,105 @@
-import { ButtonItem, DialogButton, Focusable, PanelSection, PanelSectionRow, Spinner, ToggleField } from "@decky/ui";
+import { ButtonItem, DialogButton, DropdownItem, Focusable, PanelSection, PanelSectionRow, Spinner, ToggleField } from "@decky/ui";
+import qrcode from "qrcode-generator";
 import { LazyTextField } from "./Fields";
 import { useEffect, useState } from "react";
+import type { ReactElement } from "react";
 import { useQuickAccessVisible } from "@decky/api";
 import * as api from "./backend";
-import type { CliInfo, Limits, State } from "./backend";
+import type { CliInfo, Limits, Mode, State } from "./backend";
 import { Answer } from "./Answer";
 import { SettingsRows } from "./Settings";
 import {
-  openReader, runningGame, setCachedSettings, setCurrent, setLimits, setPanelOpen, startAsk, useCurrent, useLimits,
+  achievementSummary, openReader, runningGame, setCachedSettings, setCurrent, setLimits, setPanelOpen, startAsk,
+  useCurrent, useLimits,
 } from "./store";
 
-const QUICK = [
-  { label: "📷 Что мне делать?", q: "Что мне сейчас делать? Подскажи по скриншоту.", shot: true },
-  { label: "📷 Как пройти это?", q: "Как пройти то, что на скриншоте: бой, головоломку или препятствие?", shot: true },
-  { label: "📷 Объясни экран", q: "Объясни, что сейчас на экране: интерфейс, предметы, характеристики.", shot: true },
-  { label: "🧭 Что я пропустил?", q: "Что важного я мог пропустить на текущем этапе игры?", shot: false },
+const QUICK: { label: string; q: string; shot: boolean; mode: Mode }[] = [
+  { label: "📷 Что мне делать?", q: "Что мне сейчас делать? Подскажи по скриншоту.", shot: true, mode: "quick" },
+  { label: "📷 Как пройти это?", q: "Как пройти то, что на скриншоте: бой, головоломку или препятствие?", shot: true, mode: "quick" },
+  { label: "📷 Объясни экран", q: "Объясни, что сейчас на экране: интерфейс, предметы, характеристики.", shot: true, mode: "quick" },
+  { label: "🧭 Что я пропустил?", q: "Что важного я мог пропустить на текущем этапе игры?", shot: false, mode: "quick" },
+  {
+    label: "⏪ На чём я остановился?",
+    q: "На чём я остановился? Коротко напомни, что я делал в прошлый раз и что собирался делать дальше.",
+    shot: true, mode: "recap",
+  },
 ];
+const ACHIEVEMENTS_Q = "Какие достижения мне стоит получить сейчас и какие легко упустить?";
+
+/** A QR code drawn as SVG rectangles, so a phone camera can open the page. */
+function QrCode({ text, size = 180 }: { text: string; size?: number }) {
+  const qr = qrcode(0, "M");
+  qr.addData(text);
+  qr.make();
+  const n = qr.getModuleCount();
+  const cells: ReactElement[] = [];
+  for (let r = 0; r < n; r++) {
+    for (let c = 0; c < n; c++) {
+      if (qr.isDark(r, c)) cells.push(<rect key={`${r}-${c}`} x={c + 2} y={r + 2} width={1.02} height={1.02} />);
+    }
+  }
+  return (
+    <svg viewBox={`0 0 ${n + 4} ${n + 4}`} width={size} height={size} style={{ background: "#fff", borderRadius: "6px" }}>
+      <g fill="#000">{cells}</g>
+    </svg>
+  );
+}
+
+const SPOILER_OPTIONS = [
+  { data: "", label: "Как в настройках" },
+  { data: "hint", label: "Намёк, решение под шторкой" },
+  { data: "balanced", label: "Помощь, спойлеры под шторкой" },
+  { data: "full", label: "Полное решение сразу" },
+];
+
+/** Per-game settings and the phone page. */
+function GameSection({ state, appid, name, refresh }: { state: State; appid: number; name: string; refresh: () => void }) {
+  const [phoneError, setPhoneError] = useState("");
+  const [phoneBusy, setPhoneBusy] = useState(false);
+  const phone = state.phone;
+  const setGame = async (patch: { spoiler?: string; wiki?: string }) => {
+    await api.setGame(appid, patch);
+    refresh();
+  };
+  const togglePhone = async (on: boolean) => {
+    setPhoneError("");
+    setPhoneBusy(true);
+    if (on) {
+      const r = await api.phoneStart(appid, name);
+      if (!r.ok) setPhoneError(r.error || "Не получилось");
+    } else {
+      await api.phoneStop();
+    }
+    setPhoneBusy(false);
+    refresh();
+  };
+  return (
+    <PanelSection title="Эта игра">
+      <PanelSectionRow>
+        <DropdownItem label="Спойлеры в этой игре" selectedOption={state.game.spoiler} rgOptions={SPOILER_OPTIONS}
+          onChange={(o) => setGame({ spoiler: o.data })} />
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <LazyTextField label="Любимая вики (например zelda.fandom.com)" value={state.game.wiki} delay={1500}
+          onCommit={(v) => setGame({ wiki: v })} />
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ToggleField label="📱 Гайд и ответы на телефоне" disabled={phoneBusy}
+          description="Откроет страницу для телефона в той же Wi-Fi сети. Только чтение, выключится сама через 3 часа."
+          checked={phone.running} onChange={togglePhone} />
+      </PanelSectionRow>
+      {phone.running && phone.url && (
+        <PanelSectionRow>
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "6px" }}>
+            <QrCode text={phone.url} />
+            <div style={{ ...small, wordBreak: "break-all", textAlign: "center" }}>{phone.url}</div>
+          </div>
+        </PanelSectionRow>
+      )}
+      {phoneError && <PanelSectionRow><div style={{ fontSize: "12px", color: "#ff8080" }}>{phoneError}</div></PanelSectionRow>}
+    </PanelSection>
+  );
+}
 
 const box = { padding: "8px 10px", borderRadius: "6px", background: "rgba(255,255,255,0.06)" };
 const small = { fontSize: "12px", opacity: 0.7 };
@@ -185,6 +269,7 @@ export function Panel() {
   const [notes, setNotesText] = useState("");
   const [showHistory, setShowHistory] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [achievements, setAchievements] = useState<{ total: number; unlocked: number } | null>(null);
   const cur = useCurrent();
   const limits = useLimits();
   const game = runningGame();
@@ -208,7 +293,10 @@ export function Panel() {
   const visible = useQuickAccessVisible();
   useEffect(() => {
     setPanelOpen(visible);
-    if (visible) refresh();
+    if (visible) {
+      refresh();
+      achievementSummary().then(setAchievements);
+    }
   }, [visible]);
 
   useEffect(() => {
@@ -230,7 +318,7 @@ export function Panel() {
     setCachedSettings(next);
     if ("auth_mode" in patch || "api_key" in patch) recheck();
   };
-  const ask = (q: string, shot: boolean) => startAsk(q, shot, "quick", "panel");
+  const ask = (q: string, shot: boolean, mode: Mode = "quick") => startAsk(q, shot, mode, "panel");
   const upd = state?.update;
 
   return (
@@ -258,10 +346,15 @@ export function Panel() {
           <Focusable style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "6px" }}>
             {QUICK.map((b) => (
               <ButtonItem key={b.label} layout="below" disabled={busy || !ready || (b.shot && !game.appid)}
-                onClick={() => ask(b.q, b.shot)}>
+                onClick={() => ask(b.q, b.shot && !!game.appid, b.mode)}>
                 <span style={{ fontSize: "12px" }}>{b.label}</span>
               </ButtonItem>
             ))}
+            {achievements && (
+              <ButtonItem layout="below" disabled={busy || !ready} onClick={() => ask(ACHIEVEMENTS_Q, false, "achievements")}>
+                <span style={{ fontSize: "12px" }}>🏆 Достижения {achievements.unlocked}/{achievements.total}</span>
+              </ButtonItem>
+            )}
           </Focusable>
         </PanelSectionRow>
         <PanelSectionRow>
@@ -280,6 +373,8 @@ export function Panel() {
           </Focusable>
         </PanelSectionRow>
       </PanelSection>
+
+      {game.appid > 0 && state && <GameSection state={state} appid={game.appid} name={game.name} refresh={refresh} />}
 
       {game.appid > 0 && (
         <PanelSection title="Глубокий разбор">

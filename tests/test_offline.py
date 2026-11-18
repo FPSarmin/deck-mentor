@@ -13,7 +13,7 @@ import zlib
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "py_modules"))
 
-from deck_mentor import capture, cleanup, games, hotkey, prompts, running  # noqa: E402
+from deck_mentor import capture, cleanup, games, hotkey, phone, prompts, running  # noqa: E402
 from deck_mentor.voice import Voice  # noqa: E402
 
 
@@ -359,6 +359,106 @@ def test_data_dir_skips_extracted_game_files():
         finally:
             running.hints = original
             del os.environ["DECKY_USER_HOME"]
+
+
+def test_history_and_wiki_in_context():
+    now = 1_000_000.0
+    history = [
+        {"q": "Где ключ?", "a": "У статуи.\n<<<SPOILER>>>\nПод левой ногой", "ts": now - 3 * 86400, "ok": True},
+        {"q": "сломалось", "a": "", "ts": now - 7200, "ok": False},
+        {"q": "Как победить босса?", "a": "Уклоняйся вправо. " * 40, "ts": now - 600, "ok": True},
+    ]
+    block = prompts.history_block(history, 5, now=now)
+    assert block.startswith("<earlier_questions>") and block.endswith("</earlier_questions>")
+    assert "[3 days ago] Q: Где ключ?\nA: У статуи." in block
+    assert "Под левой ногой" not in block and "сломалось" not in block
+    assert "[10 min ago] Q: Как победить босса?" in block and "…" in block
+    assert prompts.history_block(history, 1, now=now).count("Q:") == 1
+    assert prompts.history_block([], 5) == ""
+    ctx = prompts.context_block("Zelda", 0, "", "", "", False, history=block, wiki="zelda.fandom.com")
+    assert "preferred_source: zelda.fandom.com" in ctx and "spoiler_level: balanced" in ctx
+    assert ctx.index("</context>") < ctx.index("<earlier_questions>")
+    task = prompts.deep_task("Zelda", None, "hint", False, "", "zelda.fandom.com")
+    assert "zelda.fandom.com" in task
+
+
+def test_missing_achievements_in_facts():
+    block = prompts.facts_block({
+        "source": "steam", "achievements_total": 3, "achievements_unlocked": 1,
+        "missing_achievements": [
+            {"name": "Collector", "description": "Find all seeds", "global_percent": 4.25},
+            {"name": "Secret", "description": "Kill the king", "hidden": True},
+        ],
+    })
+    assert "not unlocked yet (2 listed):" in block
+    assert "- Collector (4.2% of players have it): Find all seeds" in block or "(4.3% of players" in block
+    assert "- Secret [hidden]" in block and "Kill the king" not in block
+
+
+def test_phone_html():
+    html_text = phone.to_html("# Где ты\nИди к **мосту** <script>x</script>\n- раз\n- [вики](https://w.example/a?b=1&c=2)\n"
+                              "1. шаг\n<<<SPOILER>>>\nБосс слаб к огню")
+    assert "<h3>Где ты</h3>" in html_text and "<b>мосту</b>" in html_text
+    assert "<script>" not in html_text and "&lt;script&gt;" in html_text
+    assert "<ul>\n<li>раз</li>" in html_text and "<ol>\n<li>шаг</li>\n</ol>" in html_text
+    assert 'href="https://w.example/a?b=1&amp;c=2"' in html_text and 'rel="noopener"' in html_text
+    assert '<details class="spoiler">' in html_text and "Босс слаб к огню" in html_text.split("<details")[1]
+    assert phone.to_html('[x](javascript:alert(1))').count("<a ") == 0
+    assert phone.to_html("") == ""
+
+
+def _http_get(port, path):
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as conn:
+        conn.sendall(f"GET {path} HTTP/1.1\r\nHost: x\r\n\r\n".encode())
+        data = b""
+        while True:
+            chunk = conn.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+    head, _, body = data.partition(b"\r\n\r\n")
+    return int(head.split()[1]), body
+
+
+def test_phone_server():
+    page = {
+        "game": "Savage Wind", "guide": "## Где ты\nПлато",
+        "history": [{"q": "Где ключ?", "a": "У статуи", "ts": 1, "ok": True}],
+        "current": {"question": "Что делать?", "text": "Иду", "answer": "", "done": False, "status": "Ищу в сети"},
+    }
+    server = phone.PhoneServer(logging.getLogger("test"), lambda: page)
+    original = phone.local_ip
+    phone.local_ip = lambda: "127.0.0.1"
+
+    async def scenario():
+        status = await server.start()
+        assert status["running"] and status["url"].startswith("http://127.0.0.1:")
+        port = int(status["url"].split(":")[2].split("/")[0])
+        token = server.token
+        loop = asyncio.get_running_loop()
+        get = lambda path: loop.run_in_executor(None, _http_get, port, path)  # noqa: E731
+        code, body = await get(f"/{token}")
+        assert code == 200 and b"Deck Mentor" in body
+        code, body = await get(f"/{token}/data")
+        import json
+        data = json.loads(body)
+        assert code == 200 and data["game"] == "Savage Wind" and "<h3>Где ты</h3>" in data["guide"]
+        assert data["current"]["status"] == "Ищу в сети" and data["history"][0]["q"] == "Где ключ?"
+        assert (await get("/"))[0] == 404 and (await get("/wrong/data"))[0] == 404
+        again = await server.start()  # extends the timer, keeps the address
+        assert again["url"] == status["url"]
+        await server.stop()
+        assert not server.status()["running"]
+        try:
+            await get(f"/{token}")
+            raise AssertionError("server still answers after stop")
+        except OSError:
+            pass
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        phone.local_ip = original
 
 
 if __name__ == "__main__":

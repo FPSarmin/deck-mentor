@@ -61,6 +61,15 @@ export function SettingsRows({ state, cli, busy, update, refresh }: Props) {
           ]} />
       </PanelSectionRow>
       <PanelSectionRow>
+        <DropdownItem label="Модель для горячих клавиш" selectedOption={s.quick_model} onChange={(o) => update({ quick_model: o.data })}
+          rgOptions={[
+            { data: "same", label: "Та же, что выше" },
+            { data: "sonnet", label: "Sonnet (быстрее)" },
+            { data: "haiku", label: "Haiku (за секунды)" },
+            { data: "opus", label: "Opus" },
+          ]} />
+      </PanelSectionRow>
+      <PanelSectionRow>
         <DropdownItem label="Глубина размышлений" selectedOption={s.effort} onChange={(o) => update({ effort: o.data })}
           rgOptions={[
             { data: "low", label: "Быстро" },

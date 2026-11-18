@@ -3,7 +3,7 @@ import { addEventListener, callable } from "@decky/api";
 export const EVENT = "deck_mentor_event";
 export const HOTKEY_EVENT = "deck_mentor_hotkey";
 
-export type Mode = "quick" | "deep";
+export type Mode = "quick" | "deep" | "recap" | "achievements";
 export type Origin = "panel" | "hotkey" | "voice";
 export const SPOILER_MARK = "<<<SPOILER>>>";
 
@@ -12,6 +12,7 @@ export interface Settings {
   api_key: string;
   claude_path: string;
   model: "opus" | "sonnet" | "haiku";
+  quick_model: "same" | "opus" | "sonnet" | "haiku";
   effort: "low" | "medium" | "high";
   spoiler: "hint" | "balanced" | "full";
   web_search: boolean;
@@ -36,6 +37,7 @@ export interface Facts {
   achievements_total?: number;
   achievements_unlocked?: number;
   recent_achievements?: { name: string; description: string }[];
+  missing_achievements?: { name: string; description: string; hidden: boolean; global_percent?: number }[];
   source?: "steam" | "non-steam";
 }
 
@@ -113,7 +115,22 @@ export interface State {
   limits: Limits | null;
   version: string;
   update: UpdateInfo | null;
-  game: { notes: string; history: HistoryEntry[]; history_total: number; guide: string; turns: number };
+  phone: PhoneStatus;
+  game: {
+    spoiler: "" | "hint" | "balanced" | "full";
+    wiki: string;
+    notes: string;
+    history: HistoryEntry[];
+    history_total: number;
+    guide: string;
+    turns: number;
+  };
+}
+
+export interface PhoneStatus {
+  running: boolean;
+  url: string;
+  expires: number;
 }
 
 export interface CliInfo {
@@ -144,6 +161,9 @@ export type HotkeyEvent =
 export const getState = callable<[appid: number], State>("get_state");
 export const checkCli = callable<[], CliInfo>("check_cli");
 export const setSettings = callable<[patch: Partial<Settings>], Settings>("set_settings");
+export const setGame = callable<[appid: number, patch: { spoiler?: string; wiki?: string }], { spoiler: string; wiki: string }>("set_game");
+export const phoneStart = callable<[appid: number, game: string], PhoneStatus & { ok: boolean; error?: string }>("phone_start");
+export const phoneStop = callable<[], boolean>("phone_stop");
 export const setNotes = callable<[appid: number, notes: string], boolean>("set_notes");
 export const deleteGuide = callable<[appid: number], boolean>("delete_guide");
 export const newChat = callable<[appid: number], boolean>("new_chat");

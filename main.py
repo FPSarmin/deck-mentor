@@ -18,7 +18,7 @@ _PY_MODULES = os.path.join(decky.DECKY_PLUGIN_DIR, "py_modules")
 if _PY_MODULES not in sys.path:
     sys.path.insert(0, _PY_MODULES)
 
-from deck_mentor import capture, claude_cli, cleanup, downloads, games, prompts  # noqa: E402
+from deck_mentor import capture, claude_cli, cleanup, downloads, games, phone, prompts  # noqa: E402
 from deck_mentor.hotkey import COMBOS, Binding, HotkeyListener  # noqa: E402
 from deck_mentor.store import GameState, Settings  # noqa: E402
 from deck_mentor.util import clean_env, dir_size, which  # noqa: E402
@@ -58,6 +58,8 @@ class Plugin:
         self.cli_info = None
         self.last_cleanup = 0.0
         self.hotkey = HotkeyListener(decky.logger)
+        self.phone_appid = 0
+        self.phone = phone.PhoneServer(decky.logger, lambda: self._phone_page())
         self.voice = Voice(decky.DECKY_PLUGIN_DIR, decky.DECKY_PLUGIN_RUNTIME_DIR, decky.logger)
         self.limits_path = os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, "limits.json")
         try:
@@ -88,6 +90,7 @@ class Plugin:
                 pass
 
     async def _stop_all(self):
+        await self.phone.stop()
         await self.voice.cancel_recording()
         await self.voice.stop_speaking()
         await self.cancel()
@@ -226,7 +229,10 @@ class Plugin:
             "limits": self.limits if self.settings["auth_mode"] == "subscription" else None,
             "version": getattr(decky, "DECKY_PLUGIN_VERSION", ""),
             "update": self.update_info,
+            "phone": self.phone.status(),
             "game": {
+                "spoiler": state.data.get("spoiler", ""),
+                "wiki": state.data.get("wiki", ""),
                 "notes": state.data.get("notes", ""),
                 "history": state.data.get("history", [])[-30:],
                 "history_total": len(state.data.get("history", [])),
@@ -256,12 +262,54 @@ class Plugin:
             patch.pop("voice_model")
         if patch.get("tts_voice") not in (None, *PIPER_VOICES):
             patch.pop("tts_voice")
+        if patch.get("quick_model") not in (None, "same", "opus", "sonnet", "haiku"):
+            patch.pop("quick_model")
         data = self.settings.update(patch)
         if {"hotkey_enabled", "hotkey_combo", "voice_enabled", "voice_combo"} & patch.keys():
             self._apply_hotkey()
         if {"auth_mode", "api_key", "claude_path"} & patch.keys():
             self.cli_info = None
         return self.settings.public() if data else {}
+
+    async def set_game(self, appid, patch):
+        """Per-game settings: spoiler level ("" = as in settings) and a preferred wiki."""
+        self._ensure()
+        state = self._game(appid)
+        patch = dict(patch or {})
+        if patch.get("spoiler") in ("", "hint", "balanced", "full"):
+            state.data["spoiler"] = patch["spoiler"]
+        if "wiki" in patch:
+            state.data["wiki"] = str(patch["wiki"]).strip()[:200]
+        state.save()
+        return {"spoiler": state.data.get("spoiler", ""), "wiki": state.data.get("wiki", "")}
+
+    # ------------------------------------------------------------ phone page
+    async def phone_start(self, appid, game_name=""):
+        self._ensure()
+        self.phone_appid = int(appid or 0)
+        if game_name:
+            state = self._game(appid)
+            state.data["name"] = game_name
+            state.save()
+        try:
+            return {"ok": True, **(await self.phone.start())}
+        except phone.PhoneError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    async def phone_stop(self):
+        self._ensure()
+        await self.phone.stop()
+        return True
+
+    def _phone_page(self) -> dict:
+        state = self._game(self.phone_appid)
+        cur = self.current if self.current and self.current.get("appid") == self.phone_appid else None
+        return {
+            "game": state.data.get("name") or "Deck Mentor",
+            "guide": state.guide(),
+            "history": state.data.get("history", [])[-40:],
+            "current": cur and {k: cur.get(k) for k in ("question", "text", "answer", "done", "status", "mode")},
+        }
 
     async def set_notes(self, appid, notes):
         self._ensure()
@@ -313,10 +361,11 @@ class Plugin:
         return True
 
     async def ask(self, appid, game_name, question, with_shot=False, mode="quick", origin="panel", facts=None):
-        """Start a request. mode: quick | deep. origin: panel | hotkey | voice."""
+        """Start a request. mode: quick | deep | recap | achievements. origin: panel | hotkey | voice."""
         self._ensure()
         if self.task and not self.task.done():
             return {"ok": False, "error": "Я ещё отвечаю на прошлый вопрос."}
+        mode = mode if mode in ("quick", "deep", "recap", "achievements") else "quick"
         request_id = uuid.uuid4().hex[:12]
         self.current = {
             "id": request_id, "appid": int(appid or 0), "game": game_name or "", "question": question or "",
@@ -324,6 +373,8 @@ class Plugin:
             "status": "Запускаю…", "done": False, "ok": False, "answer": "", "error": "",
             "started": time.time(),
         }
+        if int(appid or 0):
+            self.phone_appid = int(appid)  # the phone page follows the game being asked about
         self.task = self.loop.create_task(self._run(request_id, int(appid or 0), game_name or "",
                                                     question or "", bool(with_shot), mode, origin,
                                                     facts if isinstance(facts, dict) else None))
@@ -455,10 +506,21 @@ class Plugin:
                 await self._emit({"id": rid, "type": "captured", "ok": bool(png_b64)})
 
             os.makedirs(state.dir, exist_ok=True)
-            spoiler = self.settings["spoiler"]
+            if game_name:
+                state.data["name"] = game_name
+            spoiler = state.data.get("spoiler") or self.settings["spoiler"]
+            wiki = state.data.get("wiki", "")
+            quick_origin = origin in ("hotkey", "voice")
+            # A fresh session knows nothing of earlier turns: give it a digest of the history.
+            history = state.data.get("history", [])
+            digest = ""
+            if mode == "recap":
+                digest = prompts.history_block(history, 15)
+            elif not deep and state.needs_new_session():
+                digest = prompts.history_block(history, 5)
             context = prompts.context_block(game_name, appid or None, spoiler, state.data.get("notes", ""),
-                                            "" if deep else state.guide(), quick=(origin in ("hotkey", "voice")),
-                                            facts=facts)
+                                            "" if deep else state.guide(), quick=quick_origin,
+                                            facts=facts, history=digest, wiki=wiki)
 
             web = ["WebSearch", "WebFetch"] if self.settings["web_search"] else []
             tools, allowed = list(web), list(web)
@@ -478,15 +540,18 @@ class Plugin:
                 # (Claude Code still auto-allows read-only commands such as ls or strings).
                 allowed = ["Read", "Glob", "Grep", "Edit(./**)", "Write(./**)",
                            "Bash(python3 *)", "Bash(rm -rf ./scratch)"] + web
-                text = prompts.deep_task(game_name, install, spoiler, bool(copied["sources"]), question)
+                text = prompts.deep_task(game_name, install, spoiler, bool(copied["sources"]), question, wiki)
                 effort = "medium" if self.settings["effort"] == "low" else self.settings["effort"]
                 max_turns = int(self.settings["deep_max_turns"])
                 timeout = DEEP_TIMEOUT
             else:
                 text = question or "Что мне сейчас делать?"
-                effort = self.settings["effort"]
+                effort = "low" if quick_origin else self.settings["effort"]
                 max_turns = 8
                 timeout = QUICK_TIMEOUT
+            model = self.settings["model"]
+            if quick_origin and self.settings["quick_model"] in ("opus", "sonnet", "haiku"):
+                model = self.settings["quick_model"]  # answers during play should come fast
 
             message = claude_cli.user_message(context + "\n\n" + text, png_b64)
             env = claude_cli.cli_env(self._api_key())
@@ -501,7 +566,7 @@ class Plugin:
                     session_args = ["--resume", state.data["session_id"]]
 
                 args = [
-                    "--model", self.settings["model"],
+                    "--model", model,
                     "--effort", effort,
                     "--system-prompt", prompts.SYSTEM_PROMPT,
                     "--tools", ",".join(tools),
