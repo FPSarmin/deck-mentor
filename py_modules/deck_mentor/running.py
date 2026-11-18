@@ -20,7 +20,8 @@ _INFRA = re.compile(
     r"sh|bash|dash|env|timeout|xdg-.*|zenity|fossilize.*|ld-linux.*)$"
 )
 _STEM_SUFFIX = re.compile(r"(\.(appimage|elf|x86_64|x86-64|x64|bin|sh|exe|run|py))+$", re.IGNORECASE)
-_ARCH_SUFFIX = re.compile(r"[-_. ]?(linux|x86[-_]?64|amd64|x64|v?\d+(\.\d+)+)$", re.IGNORECASE)
+_ARCH_SUFFIX = re.compile(r"[-_. ]?(linux|x86[-_]?64|amd64|x64|v?\d+(\.\d+)+|(alpha|beta|rc|nightly)[-_. ]?\d*)$",
+                          re.IGNORECASE)
 
 
 def _read(path: str) -> bytes:

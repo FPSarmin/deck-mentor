@@ -18,7 +18,8 @@ _SKIP_DIRS = re.compile(
     r"^(temp|tmp|cache|caches|.*cache|shadercache|d3dscache|nvidia|amd|microsoft|"
     r"crashes|crashreport.*|crashdumps|logs?|webcache|cef|gpucache|htmlcache|"
     r"steam|unity|epic.*|ubisoft game launcher|origin|ea desktop|package cache|"
-    r"mods?|textures?|texture_packs|shaders?|assets|screenshots|videos|baseroms?|roms)$",
+    r"mods?|textures?|texture_packs|shaders?|assets|screenshots|videos|baseroms?|roms|"
+    r"extracted|romfs|exefs|dump|fonts|imported_?fonts|resourcepacks)$",
     re.IGNORECASE,
 )
 # Places inside steamuser where games keep saves and settings.
@@ -110,6 +111,7 @@ _PORT_ALIASES = [
     (("starfox64", "starship"), ("starship",)),
     (("supermario64", "sm64"), ("sm64ex", "sm64", "sm64coopdx", "render96ex", "sm64plus")),
     (("perfectdark",), ("perfectdark", "pd")),
+    (("breathofthewild", "botw", "savagewind"), ("savagewind",)),
     (("jakanddaxter", "jak2", "jakii", "opengoal"), ("opengoal",)),
     (("supermetroid",), ("sm", "supermetroid")),
     (("supermarioworld",), ("smw",)),
@@ -241,7 +243,8 @@ def cloud_dirs(appid: int) -> list[str]:
 
 def _copy_tree(src: str, dst: str, budget: list[int], max_file: int, log: list[str]) -> None:
     for root, dirs, files in os.walk(src):
-        dirs[:] = [d for d in dirs if not _SKIP_DIRS.match(d) and not os.path.islink(os.path.join(root, d))]
+        dirs[:] = sorted((d for d in dirs if not _SKIP_DIRS.match(d) and not os.path.islink(os.path.join(root, d))),
+                         key=lambda d: (not _SAVE_DIR.match(d), d.lower()))  # saves first, in case the budget runs out
         rel = os.path.relpath(root, src)
         for name in files:
             path = os.path.join(root, name)
@@ -285,8 +288,8 @@ def _copy_matching_files(src: str, dst: str, names: list[str], budget: list[int]
                 log.append(f"copy failed: {path}: {exc}")
 
 
-_SAVE_DIR = re.compile(r"^(saves?|savedata|save ?games?|savefiles?|sram|states?|userdata|profiles?|memcards?|player)$",
-                       re.IGNORECASE)
+_SAVE_DIR = re.compile(r"^(saves?|savedata|save ?games?|savefiles?|sram|states?|user|usr|userdata|profiles?|memcards?|"
+                       r"player|slot ?\d+)$", re.IGNORECASE)
 _SAVE_EXT = {".sav", ".save", ".srm", ".sram", ".eep", ".fla", ".mpk", ".state", ".dsv", ".json", ".ini", ".cfg",
              ".toml", ".yaml", ".yml", ".dat", ".txt", ".xml"}
 _STRICT_SAVE_EXT = {".sav", ".save", ".srm", ".sram", ".eep", ".fla", ".mpk", ".state", ".dsv"}
@@ -357,6 +360,9 @@ def recent_save_files(since_seconds: float = 7 * 86400, limit: int = 40, time_bu
     return [p for _m, p in found[:limit]]
 
 
+SOURCE_CAP = 100_000_000
+
+
 def copy_saves(appid: int, dest: str, max_total: int = 300_000_000, max_file: int = 64_000_000,
                game_name: str = "") -> dict:
     """Copy everything that looks like saves/settings for `appid` into `dest`.
@@ -402,6 +408,11 @@ def copy_saves(appid: int, dest: str, max_total: int = 300_000_000, max_file: in
             target = os.path.join(dest, f"{label}_{i}")
             if kind == "gamedir":
                 _copy_game_dir(src, target, budget, max_file, log)
+            elif kind == "dir":
+                # A data folder can also hold extracted game files or caches: cap what one source may take.
+                share = [min(budget[0], SOURCE_CAP)]
+                _copy_tree(src, target, share, min(max_file, 16_000_000), log)
+                budget[0] -= min(budget[0], SOURCE_CAP) - share[0]
             elif kind == "prefix":
                 for sub in _PREFIX_ROOTS:
                     if os.path.isdir(os.path.join(src, sub)):

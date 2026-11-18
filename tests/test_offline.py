@@ -328,8 +328,37 @@ def test_stem():
     assert running.stem("/a/Zelda64Recompiled-x86_64.AppImage") == "Zelda64Recompiled"
     assert running.stem("soh.elf") == "soh"
     assert running.stem("2ship.AppImage") == "2ship"
+    assert running.stem("Savage_Wind-beta_3-x86_64.AppImage") == "Savage_Wind"
+    assert running.stem("SavageWind-0.1.0-alpha.1") == "SavageWind"
     assert running.stem("/x/launchers/soh.sh") == "soh"
     assert games._matches("soh", ["soh"]) and not games._matches("sohx", ["soh"]) and not games._matches("pd", ["pd"])
+
+
+def test_data_dir_skips_extracted_game_files():
+    """Savage Wind (BotW recomp) keeps extracted RomFS, caches and saves together in ~/.local/share/savagewind."""
+    with tempfile.TemporaryDirectory() as home:
+        os.environ["DECKY_USER_HOME"] = home
+        data = os.path.join(home, ".local", "share", "savagewind")
+        for rel, size in [("extracted/romfs/Pack/Dungeon000.pack", 2_000_000), ("extracted/exefs/main", 1_000_000),
+                          ("shader_cache/vk.bin", 3_000_000), ("fonts/x.ttf", 100),
+                          ("save/0/game_data.sav", 1_000_000), ("save/0/caption.jpg", 5000), ("savagewind.ini", 300)]:
+            path = os.path.join(data, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            open(path, "wb").write(b"\0" * size)
+        original = running.hints
+        running.hints = lambda appid: {"names": ["savagewind"], "dirs": [], "processes": []}
+        try:
+            for title in ("Savage_Wind-beta_3-x86_64.AppImage", "The Legend of Zelda: Breath of the Wild", "Zelda"):
+                dest = os.path.join(home, "out", title.replace(" ", "_"))
+                info = games.copy_saves(4000000001, dest, game_name=title)
+                copied = sorted(os.path.relpath(os.path.join(r, f), dest) for r, _, fs in os.walk(dest) for f in fs)
+                assert any(c.endswith("save/0/game_data.sav") for c in copied), (title, copied)
+                assert any(c.endswith("savagewind.ini") for c in copied), (title, copied)
+                assert not any(x in c for c in copied for x in ("extracted", "shader_cache", "fonts")), (title, copied)
+                assert info["copied_bytes"] < 1_100_000, info
+        finally:
+            running.hints = original
+            del os.environ["DECKY_USER_HOME"]
 
 
 if __name__ == "__main__":
